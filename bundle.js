@@ -3338,6 +3338,10 @@ function fallback_module () {
                 flex-direction: row;
                 justify-content: center;
                 align-items: center;
+                padding: 4px 8px;
+              }
+              .hat-btn:hover, .bar-btn:hover {
+                background:rgb(66, 66, 68);;
               }
             `
           }
