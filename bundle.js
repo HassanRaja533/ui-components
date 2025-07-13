@@ -3187,6 +3187,7 @@ const task_manager = require('task_manager')
 module.exports = tabsbar
 
 async function tabsbar (opts, protocol) {
+  
   const { id, sdb } = await get(opts.sid)
   const {drive} = sdb
   const on = {
@@ -3273,6 +3274,7 @@ async function tabsbar (opts, protocol) {
   }
 
   function inject_icons (data) {
+    console.log('datatatat'+data)
     dricons = data
   }
 }
@@ -3341,7 +3343,7 @@ function fallback_module () {
                 padding: 4px 8px;
               }
               .hat-btn:hover, .bar-btn:hover {
-                background:rgb(66, 66, 68);;
+                background:rgb(190, 190, 200);;
               }
             `
           }
