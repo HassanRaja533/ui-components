@@ -3274,7 +3274,6 @@ async function tabsbar (opts, protocol) {
   }
 
   function inject_icons (data) {
-    console.log('datatatat'+data)
     dricons = data
   }
 }
