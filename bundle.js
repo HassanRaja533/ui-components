@@ -3176,18 +3176,33 @@ function fallback_module () {
               .tab-entries {
                 display: flex;
                 flex-direction: row;
-                flex:auto;
+                flex: auto;
                 justify-content: flex-start;
                 align-items: center;
-                align-content: center;
                 flex-wrap: nowrap;
                 overflow-x: auto;
-                overflow-y: auto; 
+                overflow-y: hidden;
                 background-color: #131315;
                 column-gap: 14px;
                 padding: 10px 2px;
-                overflow-x: auto;
-                scrollbar-width: thin;
+                scrollbar-width: 10%;
+                -ms-overflow-style: none;
+                position: relative;
+              }
+              .tab-entries::-webkit-scrollbar {
+                height: 2px;
+                background: transparent;
+              }
+              .tab-entries::-webkit-scrollbar-thumb {
+                background-color: white;
+                border-radius: 2px;
+                visibility: hidden;
+              }
+              .tab-entries::-webkit-scrollbar-track {
+                background: transparent;
+              }
+             .tab-entries:hover::-webkit-scrollbar-thumb {
+                visibility: visible;
               }
               .tabsbtn {
                 display: flex;
