@@ -3424,8 +3424,8 @@ function fallback_module () {
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                width: 52px; /* square size */
-                border: 1px solid #3a3a3a; /* subtle border */
+                width: 52px;
+                border: 1px solid #3a3a3a; 
                 background-color: #131315;
                 cursor: pointer;
                 padding: 0;
