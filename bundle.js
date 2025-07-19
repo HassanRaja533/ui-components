@@ -3183,8 +3183,8 @@ function fallback_module () {
                 overflow-x: auto;
                 overflow-y: hidden;
                 background-color: #131315;
-                column-gap: 14px;
-                padding: 10px 2px;
+                column-gap: 9px;
+                padding: 10px 10px;
                 scrollbar-width: 10%;
                 -ms-overflow-style: none;
                 position: relative;
@@ -3215,8 +3215,15 @@ function fallback_module () {
                 max-width: 100%;                 
                 min-width: 0;                    
                 flex-shrink: 0;  
-                position: relative;                
+                position: relative;     
+                transition: background-color 0.2s ease-in-out;           
               }
+              .tabsbtn:hover {
+                background-color: #2a2a2a;
+              } 
+              .tabsbtn.active-border {
+                outline: 1px solid white;
+              }       
               .icon {
                 margin-right: 5px;
                 display: flex;
@@ -3407,31 +3414,34 @@ function fallback_module () {
                 flex-direction: row;
                 flex-wrap: nowrap;
                 align-items: stretch;
-                width: 300px;
+                width: 100px;
               }
                .bar-btn {
                 display: flex;
                 min-width: 32px;
                 border: none;
+                align-items: center;
                 background: #131315;
                 cursor: pointer;
                 flex-direction: row;
                 justify-content: center;
                 align-items: center;
-                padding: 4px 8px;
+                flex: 0 0 auto; 
+                padding-right: 20px;
               }
               .hat-btn {
                 display: flex;
                 justify-content: center;
                 align-items: center;
-                width: 52px;
+                width: 56px;
                 border: 1px solid #3a3a3a; 
                 background-color: #131315;
                 cursor: pointer;
-                padding: 0;
                 box-sizing: border-box;
+                padding: 2px 2px;
+                flex-shrink: 0;
+                flex: 0 0 auto;
               }
-              
             `
           }
         },
@@ -3521,11 +3531,14 @@ function fallback_module () {
                 color: #fff;
                 border: none;
                 border-radius: 100%;
-                padding: 4px 8px;
+                padding: 12px 18px;
                 min-width: 24px;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
+                font-size: 14px;
+                font-weight: bold; 
+                
               }
               .task-count-btn:hover {
                 background: #3d3d3d;
@@ -3684,9 +3697,6 @@ function fallback_module() {
               .replaced-tabsbar {
                 display: flex;
                 flex: auto;
-              }
-              .replaced-action-bar {
-                display: flex;
               }
               @media (max-width: 768px) {
                 .taskbar-container {
