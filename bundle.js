@@ -2993,6 +2993,8 @@ async function component (opts, protocol) {
   let init = false
   let variables = []
   let dricons = []
+  let current_id = null       
+  let highlight_target = null
   const subs = await sdb.watch(onbatch)
   let send = null
   let _ = null
@@ -3069,25 +3071,40 @@ async function component (opts, protocol) {
 
     el.className = 'tabsbtn'
     const icon_el = el.querySelector('.icon')
-    const name_el = el.querySelector('.name')
+    const name_el = el.querySelector('.name');
     const close_btn = el.querySelector('.btn')
 
-    name_el.draggable = false
+    name_el.draggable = false;
     
-    // Add click handler for tab name (switch/toggle tab)
-    name_el.onclick = () => {
-      if (_) {
-        _.up({ type: 'tab_name_clicked', data: { id, name } })
-      }
-    }
-    
+    // Click on icon
+   icon_el.onclick = () => {
+     current_id = id;
+     highlight_target = 'icon';
+     update_tab_highlight();
+
+     if (_) {
+      _.up({ type: 'tab_icon_clicked', data: { id , name} })
+     }
+   };
+
+
+// Click on name
+   name_el.onclick = () => {
+     current_id = id;
+     highlight_target = 'name';
+     update_tab_highlight();
+     if (_) {
+      _.up({ type: 'tab_name_clicked', data: { id, name } })
+     }
+   };
+
     // Add click handler for close button
-    close_btn.onclick = (e) => {
-      e.stopPropagation()
-      if (_) {
-        _.up({ type: 'tab_close_clicked', data: { id, name } })
+   close_btn.onclick = (e) => {
+     e.stopPropagation()
+     if (_) {
+       _.up({ type: 'tab_close_clicked', data: { id, name } })
       }
-    }
+   }
     
     entries.appendChild(el)
     return
@@ -3131,7 +3148,33 @@ async function component (opts, protocol) {
       }
     }, 200)
   }
+
+  function update_tab_highlight () {
+    const all_tabs = entries.querySelectorAll('.tabsbtn')
+    all_tabs.forEach(tab => {
+      tab.classList.remove('active-border')
+      tab.querySelectorAll('.name').forEach(n => n.classList.remove('active-name'))
+      tab.querySelector('.icon')?.classList.remove('active-icon')
+    })
+
+     const target_tab = Array.from(all_tabs).find(tab => {
+     const names = tab.querySelectorAll('.name')
+     return Array.from(names).some(n => n.textContent === current_id)
+    })
+
+    target_tab.classList.add('active-border');
+
+    if (highlight_target === 'name') {
+      target_tab.querySelectorAll('.name').forEach(n => n.classList.add('active-name'))
+    }
+
+    if (highlight_target === 'icon') {
+      target_tab.querySelector('.icon')?.classList.add('active-icon')
+    }
+  }
 }
+
+
 
 function fallback_module () {
   return {
@@ -3251,6 +3294,12 @@ function fallback_module () {
                 width: 20px;
                 height: 20px;
                 flex-shrink: 0;  
+              }
+              .name.active-name {
+                color: white;
+              }
+              .icon.active-icon svg {
+                filter: brightness(2);
               }
             `
           }
