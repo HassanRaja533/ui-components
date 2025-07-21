@@ -3082,9 +3082,9 @@ async function component (opts, protocol) {
      highlight_target = 'icon';
      update_tab_highlight();
 
-     if (_) {
-      _.up({ type: 'tab_icon_clicked', data: { id , name} })
-     }
+    //  if (_) {
+    //   _.up({ type: 'tab_icon_clicked', data: { id , name} })
+    //  }
    };
 
 
@@ -3093,9 +3093,9 @@ async function component (opts, protocol) {
      current_id = id;
      highlight_target = 'name';
      update_tab_highlight();
-     if (_) {
-      _.up({ type: 'tab_name_clicked', data: { id, name } })
-     }
+    //  if (_) {
+    //   _.up({ type: 'tab_name_clicked', data: { id, name } })
+    //  }
    };
 
     // Add click handler for close button
