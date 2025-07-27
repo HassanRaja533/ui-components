@@ -3456,6 +3456,7 @@ function fallback_module () {
                 flex-direction: row;
                 flex-wrap: nowrap;
                 align-items: stretch;
+                border-top: 1px solid #3a3a3a;
               }
               .tabs-bar {
                 display: flex;
