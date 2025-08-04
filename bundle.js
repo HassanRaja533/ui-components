@@ -2,14 +2,1214 @@
 
 },{}],2:[function(require,module,exports){
 (function (__filename){(function (){
+const STATE = require('./STATE')
+const statedb = STATE(__filename)
+const { get } = statedb(fallback_module)
+
+module.exports = graph_explorer
+
+async function graph_explorer(opts) {
+/******************************************************************************
+  1. COMPONENT INITIALIZATION
+    - This sets up the initial state, variables, and the basic DOM structure.
+    - It also initializes the IntersectionObserver for virtual scrolling and
+      sets up the watcher for state changes.
+******************************************************************************/
+  const { sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  let vertical_scroll_value = 0
+  let horizontal_scroll_value = 0
+  let selected_instance_paths = []
+  let confirmed_instance_paths = []
+  let all_entries = {} // Holds the entire graph structure from entries.json.
+  let instance_states = {} // Holds expansion state {expanded_subs, expanded_hubs} for each node instance.
+  let search_state_instances = {}
+  let view = [] // A flat array representing the visible nodes in the graph.
+  let mode // Current mode of the graph explorer, can be set to 'default', 'menubar' or 'search'. Its value should be set by the `mode` file in the drive.
+  let previous_mode = 'menubar'
+  let search_query = ''
+  let drive_updated_by_scroll = false // Flag to prevent `onbatch` from re-rendering on scroll updates.
+  let drive_updated_by_toggle = false // Flag to prevent `onbatch` from re-rendering on toggle updates.
+  let drive_updated_by_search = false // Flag to prevent `onbatch` from re-rendering on search updates.
+  let is_rendering = false // Flag to prevent concurrent rendering operations in virtual scrolling.
+  let spacer_element = null // DOM element used to manage scroll position when hubs are toggled.
+  let spacer_initial_height = 0
+  let hub_num = 0 // Counter for expanded hubs.
+
+  const el = document.createElement('div')
+  el.className = 'graph-explorer-wrapper'
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+    <div class="menubar"></div>
+    <div class="graph-container"></div>
+  `
+  const menubar = shadow.querySelector('.menubar')
+  const container = shadow.querySelector('.graph-container')
+
+  document.body.style.margin = 0
+  
+  let scroll_update_pending = false
+  container.onscroll = onscroll
+
+  let start_index = 0
+  let end_index = 0
+  const chunk_size = 50
+  const max_rendered_nodes = chunk_size * 3
+  let node_height
+
+  const top_sentinel = document.createElement('div')
+  const bottom_sentinel = document.createElement('div')
+  
+  const observer = new IntersectionObserver(handle_sentinel_intersection, {
+    root: container,
+    rootMargin: '500px 0px',
+    threshold: 0
+  })
+  // Define handlers for different data types from the drive, called by `onbatch`.
+  const on = {
+    entries: on_entries,
+    style: inject_style,
+    runtime: on_runtime,
+    mode: on_mode
+  }
+  // Start watching for state changes. This is the main trigger for all updates.
+  await sdb.watch(onbatch)
+
+  return el
+
+/******************************************************************************
+  2. STATE AND DATA HANDLING
+    - These functions process incoming data from the STATE module's `sdb.watch`.
+    - `onbatch` is the primary entry point.
+******************************************************************************/
+  async function onbatch(batch) {
+    // Prevent feedback loops from scroll or toggle actions.
+    if (drive_updated_by_scroll) {
+      drive_updated_by_scroll = false
+      return
+    }
+    if (drive_updated_by_toggle) {
+      drive_updated_by_toggle = false
+      return
+    }
+    if (drive_updated_by_search) {
+      drive_updated_by_search = false
+      return
+    }
+
+    for (const { type, paths } of batch) {
+      if (!paths || paths.length === 0) continue
+      const data = await Promise.all(paths.map(async (path) => {
+        try {
+          const file = await drive.get(path)
+          if (!file) return null
+          return file.raw
+        } catch (e) {
+          console.error(`Error getting file from drive: ${path}`, e)
+          return null
+        }
+      }))
+      // Call the appropriate handler based on `type`.
+      const func = on[type]
+      func ? func({ data, paths }) : fail(data, type)
+    }
+  }
+
+  function fail (data, type) { throw new Error(`Invalid message type: ${type}`, { cause: { data, type } }) }
+
+  function on_entries({ data }) {
+    if (!data || data[0] === null || data[0] === undefined) {
+      console.error('Entries data is missing or empty.')
+      all_entries = {}
+      return
+    }
+    try {
+      const parsed_data = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+      if (typeof parsed_data !== 'object' || parsed_data === null) {
+        console.error('Parsed entries data is not a valid object.')
+        all_entries = {}
+        return
+      }
+      all_entries = parsed_data
+    } catch (e) {
+      console.error('Failed to parse entries data:', e)
+      all_entries = {}
+      return
+    }
+  
+    // After receiving entries, ensure the root node state is initialized and trigger the first render.
+    const root_path = '/'
+    if (all_entries[root_path]) {
+      const root_instance_path = '|/'
+      if (!instance_states[root_instance_path]) {
+        instance_states[root_instance_path] = { expanded_subs: true, expanded_hubs: false }
+      }
+      build_and_render_view()
+    } else {
+      console.warn('Root path "/" not found in entries. Clearing view.')
+      view = []
+      if (container) container.replaceChildren()
+    }
+  }
+
+  function on_runtime ({ data, paths }) {
+    let needs_render = false
+    const render_nodes_needed = new Set()
+
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i]
+      if (data[i] === null) continue
+      
+      let value
+      try {
+        value = typeof data[i] === 'string' ? JSON.parse(data[i]) : data[i]
+      } catch (e) {
+        console.error(`Failed to parse JSON for ${path}:`, e)
+        continue
+      }
+      // Handle different runtime state updates based on the path i.e files
+      switch (true) {
+        case path.endsWith('node_height.json'):
+          node_height = value
+          break
+        case path.endsWith('vertical_scroll_value.json'):
+          if (typeof value === 'number') vertical_scroll_value = value
+          break
+        case path.endsWith('horizontal_scroll_value.json'):
+          if (typeof value === 'number') horizontal_scroll_value = value
+          break
+        case path.endsWith('selected_instance_paths.json'): {
+          const old_paths = [...selected_instance_paths]
+          if (Array.isArray(value)) {
+            selected_instance_paths = value
+          } else {
+            console.warn('selected_instance_paths is not an array, defaulting to empty.', value)
+            selected_instance_paths = []
+          }
+          const changed_paths = [...new Set([...old_paths, ...selected_instance_paths])]
+          changed_paths.forEach(p => render_nodes_needed.add(p))
+          break
+        }
+        case path.endsWith('confirmed_selected.json'): {
+          const old_paths = [...confirmed_instance_paths]
+          if (Array.isArray(value)) {
+            confirmed_instance_paths = value
+          } else {
+            console.warn('confirmed_selected is not an array, defaulting to empty.', value)
+            confirmed_instance_paths = []
+          }
+          const changed_paths = [...new Set([...old_paths, ...confirmed_instance_paths])]
+          changed_paths.forEach(p => render_nodes_needed.add(p))
+          break
+        }
+        case path.endsWith('instance_states.json'):
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          instance_states = value
+          needs_render = true
+        } else console.warn('instance_states is not a valid object, ignoring.', value)
+        break
+      }
+    }
+
+    if (needs_render) {
+      build_and_render_view()
+    } else if (render_nodes_needed.size > 0) {
+      render_nodes_needed.forEach(re_render_node)
+    }
+  }
+
+  function on_mode ({ data, paths }) {
+    let new_current_mode
+    let new_previous_mode
+    let new_search_query
+
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i]
+      const raw_data = data[i]
+      if (raw_data === null) continue
+      let value
+      try {
+        value = JSON.parse(raw_data)
+      } catch (e) {
+        console.error(`Failed to parse JSON for ${path}:`, e)
+        continue
+      }
+      if (path.endsWith('current_mode.json')) new_current_mode = value
+      else if (path.endsWith('previous_mode.json')) new_previous_mode = value
+      else if (path.endsWith('search_query.json')) new_search_query = value
+    }
+
+    if (typeof new_search_query === 'string') search_query = new_search_query
+    if (new_previous_mode) previous_mode = new_previous_mode
+    if (new_current_mode === 'search' && !search_query) {
+      search_state_instances = instance_states
+    }
+    if (!new_current_mode || mode === new_current_mode) return
+
+    if (mode && new_current_mode === 'search') {
+      update_mode_state('previous_mode', mode)
+    }
+    mode = new_current_mode
+    render_menubar()
+    handle_mode_change()
+    if (mode === 'search' && search_query) {
+      perform_search(search_query)
+    }
+  }
+
+  function inject_style({ data }) {
+    const sheet = new CSSStyleSheet()
+    sheet.replaceSync(data[0])
+    shadow.adoptedStyleSheets = [sheet]
+  }
+
+  // Helper to persist component state to the drive.
+  async function update_runtime_state (name, value) {
+    try {
+      await drive.put(`runtime/${name}.json`, JSON.stringify(value))
+    } catch (e) {
+      console.error(`Failed to update runtime state for ${name}:`, e)
+    }
+  }
+
+  async function update_mode_state (name, value) {
+    try {
+      await drive.put(`mode/${name}.json`, JSON.stringify(value))
+    } catch (e) {
+      console.error(`Failed to update mode state for ${name}:`, e)
+    }
+  }
+
+/******************************************************************************
+  3. VIEW AND RENDERING LOGIC
+    - These functions build the `view` array and render the DOM.
+    - `build_and_render_view` is the main orchestrator.
+    - `build_view_recursive` creates the flat `view` array from the hierarchical data.
+******************************************************************************/
+  function build_and_render_view(focal_instance_path, hub_toggle = false) {
+    if (Object.keys(all_entries).length === 0) {
+      console.warn('No entries available to render.')
+      return
+    }
+    const old_view = [...view]
+    const old_scroll_top = vertical_scroll_value
+    const old_scroll_left = horizontal_scroll_value
+
+    let existing_spacer_height = 0
+    if (spacer_element && spacer_element.parentNode) {
+      existing_spacer_height = parseFloat(spacer_element.style.height) || 0
+    }
+
+    // Recursively build the new `view` array from the graph data.
+    view = build_view_recursive({
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub : true,
+      is_hub: false,
+      parent_pipe_trail: [],
+      instance_states,
+      all_entries
+    })
+
+    // Calculate the new scroll position to maintain the user's viewport.
+    let new_scroll_top = old_scroll_top
+    if (focal_instance_path) {
+      // If an action was focused on a specific node (like a toggle), try to keep it in the same position.
+      const old_toggled_node_index = old_view.findIndex(node => node.instance_path === focal_instance_path)
+      const new_toggled_node_index = view.findIndex(node => node.instance_path === focal_instance_path)
+
+      if (old_toggled_node_index !== -1 && new_toggled_node_index !== -1) {
+        const index_change = new_toggled_node_index - old_toggled_node_index
+        new_scroll_top = old_scroll_top + (index_change * node_height)
+      }
+    } else if (old_view.length > 0) {
+      // Otherwise, try to keep the topmost visible node in the same position.
+      const old_top_node_index = Math.floor(old_scroll_top / node_height)
+      const scroll_offset = old_scroll_top % node_height
+      const old_top_node = old_view[old_top_node_index]
+      if (old_top_node) {
+        const new_top_node_index = view.findIndex(node => node.instance_path === old_top_node.instance_path)
+        if (new_top_node_index !== -1) {
+          new_scroll_top = (new_top_node_index * node_height) + scroll_offset
+        }
+      }
+    }
+
+    const render_anchor_index = Math.max(0, Math.floor(new_scroll_top / node_height))
+    start_index = Math.max(0, render_anchor_index - chunk_size)
+    end_index = Math.min(view.length, render_anchor_index + chunk_size)
+
+    const fragment = document.createDocumentFragment()
+    for (let i = start_index; i < end_index; i++) {
+      if (view[i]) fragment.appendChild(create_node(view[i]))
+      else console.warn(`Missing node at index ${i} in view.`)
+    }
+
+    container.replaceChildren()
+    container.appendChild(top_sentinel)
+    container.appendChild(fragment)
+    container.appendChild(bottom_sentinel)
+
+    top_sentinel.style.height = `${start_index * node_height}px`
+    bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+
+    observer.observe(top_sentinel)
+    observer.observe(bottom_sentinel)
+
+    const set_scroll_and_sync = () => {
+      container.scrollTop = new_scroll_top
+      container.scrollLeft = old_scroll_left
+      vertical_scroll_value = container.scrollTop
+    }
+
+    // Handle the spacer element used for keep entries static wrt cursor by scrolling when hubs are toggled.
+    if (hub_toggle || hub_num > 0) {
+      spacer_element = document.createElement('div')
+      spacer_element.className = 'spacer'
+      container.appendChild(spacer_element)
+
+      if (hub_toggle) {
+        requestAnimationFrame(() => {
+          const container_height = container.clientHeight
+          const content_height = view.length * node_height
+          const max_scroll_top = content_height - container_height
+          
+          if (new_scroll_top > max_scroll_top) {
+            spacer_initial_height = new_scroll_top - max_scroll_top
+            spacer_initial_scroll_top = new_scroll_top
+            spacer_element.style.height = `${spacer_initial_height}px`
+          }
+          set_scroll_and_sync()
+        })
+      } else {
+        spacer_element.style.height = `${existing_spacer_height}px`
+        requestAnimationFrame(set_scroll_and_sync)
+      }
+    } else {
+      spacer_element = null
+      spacer_initial_height = 0
+      spacer_initial_scroll_top = 0
+      requestAnimationFrame(set_scroll_and_sync)
+    }
+  }
+
+  // Traverses the hierarchical `all_entries` data and builds a flat `view` array for rendering.
+  function build_view_recursive({
+    base_path,
+    parent_instance_path,
+    parent_base_path = null,
+    depth,
+    is_last_sub,
+    is_hub,
+    is_first_hub = false,
+    parent_pipe_trail,
+    instance_states,
+    all_entries
+  }) {
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const entry = all_entries[base_path]
+    if (!entry) return []
+    
+    if (!instance_states[instance_path]) {
+      instance_states[instance_path] = {
+        expanded_subs: false,
+        expanded_hubs: false
+      }
+    }
+    const state = instance_states[instance_path]
+    const is_hub_on_top = (base_path === all_entries[parent_base_path]?.hubs?.[0]) || (base_path === '/')
+
+    // Calculate the pipe trail for drawing the tree lines. Quite complex logic here.
+    const children_pipe_trail = [...parent_pipe_trail]
+    let last_pipe = null
+    if (depth > 0) {
+
+      if (is_hub) {
+        last_pipe = [...parent_pipe_trail]
+        if (is_last_sub) { 
+          children_pipe_trail.pop()
+          children_pipe_trail.push(true)
+          last_pipe.pop()
+          last_pipe.push(true)
+          if (is_first_hub) {
+            last_pipe.pop()
+            last_pipe.push(false)
+          }
+        }
+        if (is_hub_on_top && !is_last_sub) {
+          last_pipe.pop()
+          last_pipe.push(true)
+          children_pipe_trail.pop()
+          children_pipe_trail.push(true)
+        }
+        if (is_first_hub) {
+          children_pipe_trail.pop()
+          children_pipe_trail.push(false)
+        }
+      }
+      children_pipe_trail.push(is_hub || !is_last_sub)
+    }
+
+    let current_view = []
+    // If hubs are expanded, recursively add them to the view first (they appear above the node).
+    if (state.expanded_hubs && Array.isArray(entry.hubs)) {
+      entry.hubs.forEach((hub_path, i, arr) => {
+        current_view = current_view.concat(
+          build_view_recursive({
+            base_path: hub_path,
+            parent_instance_path: instance_path,
+            parent_base_path: base_path,
+            depth: depth + 1,
+            is_last_sub : i === arr.length - 1,
+            is_hub: true,
+            is_first_hub: is_hub ? is_hub_on_top : false,
+            parent_pipe_trail: children_pipe_trail,
+            instance_states,
+            all_entries
+          })
+        )
+      })
+    }
+
+    current_view.push({
+      base_path,
+      instance_path,
+      depth,
+      is_last_sub,
+      is_hub,
+      pipe_trail: ((is_hub && is_last_sub) || (is_hub && is_hub_on_top)) ? last_pipe : parent_pipe_trail,
+      is_hub_on_top
+    })
+
+    // If subs are expanded, recursively add them to the view (they appear below the node).
+    if (state.expanded_subs && Array.isArray(entry.subs)) {
+      entry.subs.forEach((sub_path, i, arr) => {
+        current_view = current_view.concat(
+          build_view_recursive({
+            base_path: sub_path,
+            parent_instance_path: instance_path,
+            depth: depth + 1,
+            is_last_sub: i === arr.length - 1,
+            is_hub: false,
+            parent_pipe_trail: children_pipe_trail,
+            instance_states,
+            all_entries
+          })
+        )
+      })
+    }
+    return current_view
+  }
+  
+/******************************************************************************
+ 4. NODE CREATION AND EVENT HANDLING
+   - `create_node` generates the DOM element for a single node.
+   - It sets up event handlers for user interactions like selecting or toggling.
+******************************************************************************/
+  
+  function create_node({ base_path, instance_path, depth, is_last_sub, is_hub, pipe_trail, is_hub_on_top, is_search_match, is_direct_match, is_in_original_view }) {
+    const entry = all_entries[base_path]
+    if (!entry) {
+      console.error(`Entry not found for path: ${base_path}. Cannot create node.`)
+      const err_el = document.createElement('div')
+      err_el.className = 'node error'
+      err_el.textContent = `Error: Missing entry for ${base_path}`
+      return err_el
+    }
+
+    const states = mode === 'search' ? search_state_instances : instance_states
+    let state = states[instance_path]
+    if (!state) {
+      console.warn(`State not found for instance: ${instance_path}. Using default.`)
+      state = { expanded_subs: false, expanded_hubs: false }
+      states[instance_path] = state
+    }
+
+    const el = document.createElement('div')
+    el.className = `node type-${entry.type || 'unknown'}`
+    el.dataset.instance_path = instance_path
+
+    if (is_search_match) {
+      el.classList.add('search-result')
+      if (is_direct_match) {
+        el.classList.add('direct-match')
+      }
+      if (!is_in_original_view) {
+        el.classList.add('new-entry')
+      }
+    }
+
+    if (selected_instance_paths.includes(instance_path)) el.classList.add('selected')
+    if (confirmed_instance_paths.includes(instance_path)) el.classList.add('confirmed')
+
+    const has_hubs = Array.isArray(entry.hubs) && entry.hubs.length > 0
+    const has_subs = Array.isArray(entry.subs) && entry.subs.length > 0
+    
+    if (depth) {
+      el.style.paddingLeft = '17.5px'
+    }
+    el.style.height = `${node_height}px`
+
+    // Handle the special case for the root node since its a bit different.
+    if (base_path === '/' && instance_path === '|/') {
+      const { expanded_subs } = state
+      const prefix_class_name = expanded_subs ? 'tee-down' : 'line-h'
+      const prefix_class = has_subs && mode !== 'search' ? 'prefix clickable' : 'prefix'
+      el.innerHTML = `<div class="wand">🪄</div><span class="${prefix_class} ${prefix_class_name}"></span><span class="name clickable">/🌐</span>`
+
+      const wand_el = el.querySelector('.wand')
+      if (wand_el) wand_el.onclick = reset
+
+      if (has_subs) {
+        const prefix_el = el.querySelector('.prefix')
+        if (prefix_el) {
+          if (mode !== 'search') {
+            prefix_el.onclick = () => toggle_subs(instance_path)
+          } else {
+            prefix_el.onclick = null
+          }
+        }
+      }
+
+      const name_el = el.querySelector('.name')
+      if (name_el) name_el.onclick = (ev) => select_node(ev, instance_path, base_path)
+
+      return el
+    }
+
+    const prefix_class_name = get_prefix({ is_last_sub, has_subs, state, is_hub, is_hub_on_top })
+    const pipe_html = pipe_trail.map(should_pipe => `<span class="${should_pipe ? 'pipe' : 'blank'}"></span>`).join('')
+    
+    const prefix_class = has_subs && mode !== 'search' ? 'prefix clickable' : 'prefix'
+    const icon_class = (has_hubs && base_path !== '/') && mode !== 'search' ? 'icon clickable' : 'icon'
+
+    el.innerHTML = `
+    <span class="indent">${pipe_html}</span>
+      <span class="${prefix_class} ${prefix_class_name}"></span>
+      <span class="${icon_class}"></span>
+      <span class="name clickable">${entry.name || base_path}</span>
+    `
+
+    if (has_hubs && base_path !== '/') {
+      const icon_el = el.querySelector('.icon')
+      if (icon_el) {
+        if (mode !== 'search') {
+          icon_el.onclick = () => toggle_hubs(instance_path)
+        } else {
+          icon_el.onclick = null
+        }
+      }
+    }
+
+    if (has_subs) {
+      const prefix_el = el.querySelector('.prefix')
+      if (prefix_el) {
+        if (mode !== 'search') {
+          prefix_el.onclick = () => toggle_subs(instance_path)
+        } else {
+          prefix_el.onclick = null
+        }
+      }
+    }
+
+    const name_el = el.querySelector('.name')
+    if (name_el) name_el.onclick = (ev) => select_node(ev, instance_path, base_path)
+    
+    if (selected_instance_paths.includes(instance_path) || confirmed_instance_paths.includes(instance_path)) {
+      const checkbox_div = document.createElement('div')
+      checkbox_div.className = 'confirm-wrapper'
+      const is_confirmed = confirmed_instance_paths.includes(instance_path)
+      checkbox_div.innerHTML = `<input type="checkbox" ${is_confirmed ? 'checked' : ''}>`
+      const checkbox_input = checkbox_div.querySelector('input')
+      if (checkbox_input) checkbox_input.onchange = (ev) => handle_confirm(ev, instance_path)
+      el.appendChild(checkbox_div)
+    }
+
+    return el
+  }
+
+  // `re_render_node` updates a single node in the DOM, used when only its selection state changes.
+  function re_render_node (instance_path) {
+    const node_data = view.find(n => n.instance_path === instance_path)
+    if (node_data) {
+      const old_node_el = shadow.querySelector(`[data-instance_path="${CSS.escape(instance_path)}"]`)
+      if (old_node_el) {
+        const new_node_el = create_node(node_data)
+        old_node_el.replaceWith(new_node_el)
+      }
+    }
+  }
+
+  // `get_prefix` determines which box-drawing character to use for the node's prefix. It gives the name of a specific CSS class.
+  function get_prefix({ is_last_sub, has_subs, state, is_hub, is_hub_on_top }) {
+    if (!state) {
+      console.error('get_prefix called with invalid state.')
+      return 'middle-line'
+    }
+    const { expanded_subs, expanded_hubs } = state
+    if (is_hub) {
+      if (is_hub_on_top) {
+        if (expanded_subs && expanded_hubs) return 'top-cross'
+        if (expanded_subs) return 'top-tee-down'
+        if (expanded_hubs) return 'top-tee-up'
+        return 'top-line'
+      } else {
+        if (expanded_subs && expanded_hubs) return 'middle-cross'
+        if (expanded_subs) return 'middle-tee-down'
+        if (expanded_hubs) return 'middle-tee-up'
+        return 'middle-line'
+      }
+    } else if (is_last_sub) {
+      if (expanded_subs && expanded_hubs) return 'bottom-cross'
+      if (expanded_subs) return 'bottom-tee-down'
+      if (expanded_hubs) return has_subs ? 'bottom-tee-up' : 'bottom-light-tee-up'
+      return has_subs ? 'bottom-line' : 'bottom-light-line'
+    } else {
+      if (expanded_subs && expanded_hubs) return 'middle-cross'
+      if (expanded_subs) return 'middle-tee-down'
+      if (expanded_hubs) return has_subs ? 'middle-tee-up' : 'middle-light-tee-up'
+      return has_subs ? 'middle-line' : 'middle-light-line'
+    }
+  }
+  
+/******************************************************************************
+  5. MENUBAR AND SEARCH
+******************************************************************************/
+  function render_menubar () {
+    menubar.replaceChildren() // Clear existing menubar
+    const search_button = document.createElement('button')
+    search_button.textContent = 'Search'
+    search_button.onclick = toggle_search_mode
+
+    menubar.appendChild(search_button)
+
+    if (mode === 'search') {
+      const search_input = document.createElement('input')
+      search_input.type = 'text'
+      search_input.placeholder = 'Search entries...'
+      search_input.className = 'search-input'
+      search_input.oninput = on_search_input
+      search_input.value = search_query
+      menubar.appendChild(search_input)
+      requestAnimationFrame(() => search_input.focus())
+    }
+  }
+
+  function handle_mode_change () {
+    if (mode === 'default') {
+      menubar.style.display = 'none'
+    } else {
+      menubar.style.display = 'flex'
+    }
+    build_and_render_view()
+  }
+
+  function toggle_search_mode () {
+    const new_mode = mode === 'search' ? previous_mode : 'search'
+    if (mode === 'search') {
+      search_query = ''
+      drive_updated_by_search = true
+      update_mode_state('search_query', '')
+    }
+    update_mode_state('current_mode', new_mode)
+    search_state_instances = instance_states
+  }
+
+  function on_search_input (event) {
+    const query = event.target.value.trim()
+    search_query = query
+    drive_updated_by_search = true
+    update_mode_state('search_query', query)
+    if (query === '') search_state_instances = instance_states
+    perform_search(query)
+  }
+
+  function perform_search (query) {
+    if (!query) {
+      build_and_render_view()
+      return
+    }
+    const original_view = build_view_recursive({
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub : true,
+      is_hub: false,
+      parent_pipe_trail: [],
+      instance_states,
+      all_entries
+    })
+    search_state_instances = {}
+    const search_view = build_search_view_recursive({
+      query,
+      base_path: '/',
+      parent_instance_path: '',
+      depth: 0,
+      is_last_sub : true,
+      is_hub: false,
+      parent_pipe_trail: [],
+      instance_states: search_state_instances, // Use a temporary state for search
+      all_entries,
+      original_view
+    })
+    render_search_results(search_view, query)
+  }
+
+  function build_search_view_recursive({
+    query,
+    base_path,
+    parent_instance_path,
+    depth,
+    is_last_sub,
+    is_hub,
+    parent_pipe_trail,
+    instance_states,
+    all_entries,
+    original_view
+  }) {
+    const entry = all_entries[base_path]
+    if (!entry) return []
+
+    const instance_path = `${parent_instance_path}|${base_path}`
+    const is_direct_match = entry.name && entry.name.toLowerCase().includes(query.toLowerCase())
+
+    let sub_results = []
+    if (Array.isArray(entry.subs)) {
+      const children_pipe_trail = [...parent_pipe_trail]
+      if (depth > 0) children_pipe_trail.push(!is_last_sub)
+
+      sub_results = entry.subs.map((sub_path, i, arr) => {
+        return build_search_view_recursive({
+          query,
+          base_path: sub_path,
+          parent_instance_path: instance_path,
+          depth: depth + 1,
+          is_last_sub: i === arr.length - 1,
+          is_hub: false,
+          parent_pipe_trail: children_pipe_trail,
+          instance_states,
+          all_entries,
+          original_view
+        })
+      }).flat()
+    }
+
+    const has_matching_descendant = sub_results.length > 0
+
+    if (!is_direct_match && !has_matching_descendant) {
+      return []
+    }
+
+    instance_states[instance_path] = {
+      expanded_subs: has_matching_descendant,
+      expanded_hubs: false
+    }
+
+    const is_in_original_view = original_view.some(node => node.instance_path === instance_path)
+
+    const current_node_view = {
+      base_path,
+      instance_path,
+      depth,
+      is_last_sub,
+      is_hub,
+      pipe_trail: parent_pipe_trail,
+      is_hub_on_top: false,
+      is_search_match: true,
+      is_direct_match,
+      is_in_original_view
+    }
+
+    return [current_node_view, ...sub_results]
+  }
+
+  function render_search_results (search_view, query) {
+    view = search_view
+    container.replaceChildren()
+
+    if (search_view.length === 0) {
+      const no_results_el = document.createElement('div')
+      no_results_el.className = 'no-results'
+      no_results_el.textContent = `No results for "${query}"`
+      container.appendChild(no_results_el)
+      return
+    }
+
+    const fragment = document.createDocumentFragment()
+    for (const node_data of search_view) {
+      fragment.appendChild(create_node(node_data))
+    }
+    container.appendChild(fragment)
+  }
+
+/******************************************************************************
+  6. VIEW MANIPULATION & USER ACTIONS
+      - These functions handle user interactions like selecting, confirming,
+        toggling, and resetting the graph.
+  ******************************************************************************/
+  function select_node(ev, instance_path) {
+    if (mode === 'search') {
+      let current_path = instance_path
+      // Traverse up the tree to expand all parents
+      while (current_path) {
+        const parent_path = current_path.substring(0, current_path.lastIndexOf('|'))
+        if (!parent_path) break // Stop if there's no parent left
+
+        if (!instance_states[parent_path]) {
+          instance_states[parent_path] = { expanded_subs: false, expanded_hubs: false }
+        }
+        instance_states[parent_path].expanded_subs = true
+        current_path = parent_path
+      }
+      drive_updated_by_toggle = true
+      update_runtime_state('instance_states', instance_states)
+      update_mode_state('current_mode', previous_mode)
+    }
+
+    if (ev.ctrlKey) {
+      const new_selected_paths = [...selected_instance_paths]
+      const index = new_selected_paths.indexOf(instance_path)
+      if (index > -1) {
+        new_selected_paths.splice(index, 1)
+      } else {
+        new_selected_paths.push(instance_path)
+      }
+      update_runtime_state('selected_instance_paths', new_selected_paths)
+    } else {
+      update_runtime_state('selected_instance_paths', [instance_path])
+    }
+  }
+
+  function handle_confirm(ev, instance_path) {
+    if (!ev.target) return console.warn('Checkbox event target is missing.')
+    const is_checked = ev.target.checked
+    const new_selected_paths = [...selected_instance_paths]
+    const new_confirmed_paths = [...confirmed_instance_paths]
+
+    if (is_checked) {
+      const idx = new_selected_paths.indexOf(instance_path)
+      if (idx > -1) new_selected_paths.splice(idx, 1)
+      if (!new_confirmed_paths.includes(instance_path)) {
+          new_confirmed_paths.push(instance_path)
+      }
+    } else {
+      if (!new_selected_paths.includes(instance_path)) {
+          new_selected_paths.push(instance_path)
+      }
+      const idx = new_confirmed_paths.indexOf(instance_path)
+      if (idx > -1) new_confirmed_paths.splice(idx, 1)
+    }
+    update_runtime_state('selected_instance_paths', new_selected_paths)
+    update_runtime_state('confirmed_selected', new_confirmed_paths)
+  }
+
+  function toggle_subs(instance_path) {
+    if (!instance_states[instance_path]) {
+      console.warn(`Toggling subs for non-existent state: ${instance_path}. Creating default state.`)
+      instance_states[instance_path] = { expanded_subs: false, expanded_hubs: false }
+    }
+    const state = instance_states[instance_path]
+    state.expanded_subs = !state.expanded_subs
+    build_and_render_view(instance_path)
+    // Set a flag to prevent the subsequent `onbatch` call from causing a render loop.
+    drive_updated_by_toggle = true
+    update_runtime_state('instance_states', instance_states)
+  }
+
+  function toggle_hubs(instance_path) {
+    if (!instance_states[instance_path]) {
+      console.warn(`Toggling hubs for non-existent state: ${instance_path}. Creating default state.`)
+      instance_states[instance_path] = { expanded_subs: false, expanded_hubs: false }
+    }
+    const state = instance_states[instance_path]
+    state.expanded_hubs ? hub_num-- : hub_num++
+    state.expanded_hubs = !state.expanded_hubs
+    build_and_render_view(instance_path, true)
+    drive_updated_by_toggle = true
+    update_runtime_state('instance_states', instance_states)
+  }
+
+  function reset() {
+    const root_path = '/'
+    const root_instance_path = '|/'
+    const new_instance_states = {}
+    if (all_entries[root_path]) {
+      new_instance_states[root_instance_path] = { expanded_subs: true, expanded_hubs: false }
+    }
+    update_runtime_state('vertical_scroll_value', 0)
+    update_runtime_state('horizontal_scroll_value', 0)
+    update_runtime_state('selected_instance_paths', [])
+    update_runtime_state('confirmed_selected', [])
+    update_runtime_state('instance_states', new_instance_states)
+  }
+
+/******************************************************************************
+  7. VIRTUAL SCROLLING
+    - These functions implement virtual scrolling to handle large graphs
+      efficiently using an IntersectionObserver.
+******************************************************************************/
+  function onscroll() {
+    if (scroll_update_pending) return
+    scroll_update_pending = true
+    requestAnimationFrame(() => {
+      const scroll_delta = vertical_scroll_value - container.scrollTop
+
+      // Handle removal of the scroll spacer.
+      if (spacer_element && scroll_delta > 0 && container.scrollTop == 0) {
+        spacer_element.remove()
+        spacer_element = null
+        spacer_initial_height = 0
+        spacer_initial_scroll_top = 0
+        hub_num = 0
+      }
+
+      if (vertical_scroll_value !== container.scrollTop) {
+        vertical_scroll_value = container.scrollTop
+        drive_updated_by_scroll = true // Set flag to prevent render loop.
+        update_runtime_state('vertical_scroll_value', vertical_scroll_value)
+      }
+      if (horizontal_scroll_value !== container.scrollLeft) {
+        horizontal_scroll_value = container.scrollLeft
+        drive_updated_by_scroll = true
+        update_runtime_state('horizontal_scroll_value', horizontal_scroll_value)
+      }
+      scroll_update_pending = false
+    })
+  }
+
+  async function fill_viewport_downwards() {
+    if (is_rendering || end_index >= view.length) return
+    is_rendering = true
+    const container_rect = container.getBoundingClientRect()
+    let sentinel_rect = bottom_sentinel.getBoundingClientRect()
+    while (end_index < view.length && sentinel_rect.top < container_rect.bottom + 500) {
+      render_next_chunk()
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      sentinel_rect = bottom_sentinel.getBoundingClientRect()
+    }
+    is_rendering = false
+  }
+
+  async function fill_viewport_upwards() {
+    if (is_rendering || start_index <= 0) return
+    is_rendering = true
+    const container_rect = container.getBoundingClientRect()
+    let sentinel_rect = top_sentinel.getBoundingClientRect()
+    while (start_index > 0 && sentinel_rect.bottom > container_rect.top - 500) {
+      render_prev_chunk()
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      sentinel_rect = top_sentinel.getBoundingClientRect()
+    }
+    is_rendering = false
+  }
+
+  function handle_sentinel_intersection(entries) {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        if (entry.target === top_sentinel) fill_viewport_upwards()
+        else if (entry.target === bottom_sentinel) fill_viewport_downwards()
+      }
+    })
+  }
+
+  function render_next_chunk() {
+    if (end_index >= view.length) return
+    const fragment = document.createDocumentFragment()
+    const next_end = Math.min(view.length, end_index + chunk_size)
+    for (let i = end_index; i < next_end; i++) if (view[i]) fragment.appendChild(create_node(view[i]))
+    container.insertBefore(fragment, bottom_sentinel)
+    end_index = next_end
+    bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+    cleanup_dom(false)
+  }
+
+  function render_prev_chunk() {
+    if (start_index <= 0) return
+    const fragment = document.createDocumentFragment()
+    const prev_start = Math.max(0, start_index - chunk_size)
+    for (let i = prev_start; i < start_index; i++) if (view[i]) fragment.appendChild(create_node(view[i]))
+    container.insertBefore(fragment, top_sentinel.nextSibling)
+    start_index = prev_start
+    top_sentinel.style.height = `${start_index * node_height}px`
+    cleanup_dom(true)
+  }
+
+  // Removes nodes from the DOM that are far outside the viewport.
+  function cleanup_dom(is_scrolling_up) {
+    const rendered_count = end_index - start_index
+    if (rendered_count <= max_rendered_nodes) return
+
+    const to_remove_count = rendered_count - max_rendered_nodes
+    if (is_scrolling_up) {
+      // If scrolling up, remove nodes from the bottom.
+      for (let i = 0; i < to_remove_count; i++) {
+        const temp = bottom_sentinel.previousElementSibling
+        if (temp && temp !== top_sentinel) {
+          temp.remove()
+        }
+      }
+      end_index -= to_remove_count
+      bottom_sentinel.style.height = `${(view.length - end_index) * node_height}px`
+    } else {
+      // If scrolling down, remove nodes from the top.
+      for (let i = 0; i < to_remove_count; i++) {
+        const temp = top_sentinel.nextElementSibling
+        if (temp && temp !== bottom_sentinel) {
+          temp.remove()
+        }
+      }
+      start_index += to_remove_count
+      top_sentinel.style.height = `${start_index * node_height}px`
+    }
+  }
+}
+
+/******************************************************************************
+  8. FALLBACK CONFIGURATION
+    - This provides the default data and API configuration for the component,
+      following the pattern described in `instructions.md`.
+    - It defines the default datasets (`entries`, `style`, `runtime`) and their
+      initial values.
+******************************************************************************/
+function fallback_module() {
+  return {
+    api: fallback_instance
+  }
+  function fallback_instance() {
+    return {
+      drive: {
+        'entries/': {
+          'entries.json': { $ref: 'entries.json' }
+        },
+        'style/': {
+          'theme.css': {
+            raw: `
+              .graph-container, .node {
+                font-family: monospace;
+              }
+              .graph-container {
+                color: #abb2bf;
+                background-color: #282c34;
+                padding: 10px;
+                height: 500px; /* Or make it flexible */
+                overflow: auto;
+              }
+              .node {
+                display: flex;
+                align-items: center;
+                white-space: nowrap;
+                cursor: default;
+              }
+              .node.error {
+                color: red;
+              }
+              .node.selected {
+                background-color: #776346;
+              }
+              .node.confirmed {
+                background-color: #774346;
+              }
+              .node.new-entry {
+                background-color: #87ceeb; /* sky blue */
+              }
+              .menubar {
+                display: flex;
+                padding: 5px;
+                background-color: #21252b;
+                border-bottom: 1px solid #181a1f;
+              }
+              .search-input {
+                margin-left: auto;
+                background-color: #282c34;
+                color: #abb2bf;
+                border: 1px solid #181a1f;
+              }
+              .confirm-wrapper {
+                margin-left: auto;
+                padding-left: 10px;
+              }
+              .indent {
+                display: flex;
+              }
+              .pipe {
+                text-align: center;
+              }
+              .pipe::before { content: '┃'; }
+              .blank {
+                width: 8.5px;
+                text-align: center;
+              }
+              .clickable {
+                cursor: pointer;
+              }
+              .prefix, .icon {
+                margin-right: 2px;
+              }
+              .top-cross::before { content: '┏╋'; }
+              .top-tee-down::before { content: '┏┳'; }
+              .top-tee-up::before { content: '┏┻'; }
+              .top-line::before { content: '┏━'; }
+              .middle-cross::before { content: '┣╋'; }
+              .middle-tee-down::before { content: '┣┳'; }
+              .middle-tee-up::before { content: '┣┻'; }
+              .middle-line::before { content: '┣━'; }
+              .bottom-cross::before { content: '┗╋'; }
+              .bottom-tee-down::before { content: '┗┳'; }
+              .bottom-tee-up::before { content: '┗┻'; }
+              .bottom-line::before { content: '┗━'; }
+              .bottom-light-tee-up::before { content: '┖┸'; }
+              .bottom-light-line::before { content: '┖─'; }
+              .middle-light-tee-up::before { content: '┠┸'; }
+              .middle-light-line::before { content: '┠─'; }
+              .tee-down::before { content: '┳'; }
+              .line-h::before { content: '━'; }
+              .icon { display: inline-block; text-align: center; }
+              .name { flex-grow: 1; }
+              .node.type-root > .icon::before { content: '🌐'; }
+              .node.type-folder > .icon::before { content: '📁'; }
+              .node.type-html-file > .icon::before { content: '📄'; }
+              .node.type-js-file > .icon::before { content: '📜'; }
+              .node.type-css-file > .icon::before { content: '🎨'; }
+              .node.type-json-file > .icon::before { content: '📝'; }
+              .node.type-file > .icon::before { content: '📄'; }
+            `
+          }
+        },
+        'runtime/': {
+          'node_height.json': { raw: '16' },
+          'vertical_scroll_value.json': { raw: '0' },
+          'horizontal_scroll_value.json': { raw: '0' },
+          'selected_instance_paths.json': { raw: '[]' },
+          'confirmed_selected.json': { raw: '[]' },
+          'instance_states.json': { raw: '{}' }
+        },
+        'mode/': {
+          'current_mode.json': { raw: '"menubar"' },
+          'previous_mode.json': { raw: '"menubar"' },
+          'search_query.json': { raw: '""' }
+        }
+      }
+    }
+  }
+}
+}).call(this)}).call(this,"/node_modules/graph-explorer/lib/graph_explorer.js")
+},{"./STATE":1}],3:[function(require,module,exports){
+arguments[4][1][0].apply(exports,arguments)
+},{"dup":1}],4:[function(require,module,exports){
+(function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
 const { sdb, get } = statedb(fallback_module)
 
 
+const quick_actions = require('quick_actions')
+const actions = require('actions')
+const steps_wizard = require('steps_wizard')
+
 module.exports = action_bar
 
-const quick_actions = require('quick_actions')
 async function action_bar(opts, protocol) {
   const { id, sdb } = await get(opts.sid)
   const { drive } = sdb
@@ -22,12 +1222,20 @@ async function action_bar(opts, protocol) {
   const shadow = el.attachShadow({ mode: 'closed' })
   
   shadow.innerHTML = `
-  <div class="action-bar-container main">
-    <div class="command-history">
-      <button class="icon-btn"></button>
+  <div class="container">
+    <div class="actions">
+      <actions></actions>
     </div>
-    <div class="quick-actions">
-      <quick-actions></quick-actions>
+    <div class="steps-wizard">
+      <steps-wizard></steps-wizard>
+    </div>
+    <div class="action-bar-container main">
+      <div class="command-history">
+        <button class="icon-btn"></button>
+      </div>
+      <div class="quick-actions">
+        <quick-actions></quick-actions>
+      </div>
     </div>
   </div>
   <style>
@@ -36,23 +1244,47 @@ async function action_bar(opts, protocol) {
   const main = shadow.querySelector('.main')
   const history_icon = shadow.querySelector('.icon-btn')
   const quick_placeholder = shadow.querySelector('quick-actions')
-
+  const actions_placeholder = shadow.querySelector('actions')
+  const steps_wizard_placeholder = shadow.querySelector('steps-wizard')
 
   let console_icon = {}
   const subs = await sdb.watch(onbatch)
 
-  let send = null
-  let _ = null
+  const _ = {
+    up: null,
+    send_quick_actions: null,
+    send_actions: null,
+    send_steps_wizard: null
+  }
+  let actions_data = null
+  let selected_action = null
+
   if(protocol){
-    send = protocol(msg => onmessage(msg))
-    _ = { up: send, send_quick_actions: null }
+    let send = protocol(msg => onmessage(msg))
+    _.up = send
   }
 
   history_icon.innerHTML = console_icon
   history_icon.onclick = onhistory
   const element = protocol ? await quick_actions(subs[0], quick_actions_protocol) : await quick_actions(subs[0])
-  element.classList.add('replaced-quick-actions')
   quick_placeholder.replaceWith(element)
+
+  const actions_el = await actions(subs[1], actions_protocol)
+  actions_el.classList.add('hide')
+  actions_placeholder.replaceWith(actions_el)
+
+  const steps_wizard_el = await steps_wizard(subs[2], steps_wizard_protocol)
+  steps_wizard_el.classList.add('hide')
+  steps_wizard_placeholder.replaceWith(steps_wizard_el)
+
+  const parent_handler = {
+    load_actions,
+    selected_action: parent__selected_action,
+    show_submit_btn,
+    hide_submit_btn,
+    form_data
+  }
+
   return el
 
   async function onbatch (batch) {
@@ -74,19 +1306,142 @@ async function action_bar(opts, protocol) {
   function onhistory() {
     _.up({ type: 'console_history_toggle', data: null })
   }
-  // ---------
-  // PROTOCOLS  
-  // ---------
+
+
+  // --- Toggle Views ---
+  function toggle_view(el, show) {
+    el.classList.toggle('hide', !show)
+  }
+
+  function actions_toggle_view(display) {
+    toggle_view(actions_el, display === 'block')
+  }
+
+  function steps_toggle_view(display) {
+    toggle_view(steps_wizard_el, display === 'block')
+  }
+
+  // -------------------------------
+  // Protocol: actions
+  // -------------------------------
+  
+  function actions_protocol(send) {
+    _.send_actions = send
+
+    const actions_handlers = {
+      selected_action: actions__selected_action
+    }
+
+    return function on({ type, data }) {
+      const handler = actions_handlers[type] || fail
+      handler(data, type)
+    }
+  }
+
+  function actions__selected_action(data, type) {
+    selected_action = data?.action || null
+    _.send_quick_actions?.({
+      type,
+      data: {
+        ...data,
+        total_steps: actions_data[selected_action]?.length || 0
+      }
+    })
+
+    _.send_steps_wizard?.({ type: 'init_data', data: actions_data[selected_action] })
+    steps_toggle_view('block')
+
+    if (actions_data[selected_action]?.length > 0) {
+      const first_step = actions_data[selected_action][0]
+      _.up?.({ type: 'render_form', data: first_step })
+    }
+
+    if (actions_data[selected_action][actions_data[selected_action].length - 1]?.is_completed) {
+      _?.send_quick_actions({ type: 'show_submit_btn' })
+    }
+
+    _.up?.({ type, data: selected_action })
+    actions_toggle_view('none')
+  }
+
+
+  // -------------------------------
+  // Protocol: quick actions
+  // -------------------------------
+
+
   function quick_actions_protocol (send) {
     _.send_quick_actions = send
+
+    const quick_handlers = {
+      display_actions: quick_actions__display_actions,
+      action_submitted: quick_actions__action_submitted
+    }
+
     return on
     function on ({ type, data }) {
-      _.up({ type, data })
+      const handler = quick_handlers[type] || fail
+      handler(data, type)
+      
     }
   }
   
+  function quick_actions__display_actions(data) {
+    actions_toggle_view(data)
+    if (data === 'none') {
+      steps_toggle_view('none')
+      _.up?.({ type: 'clean_up', data: selected_action })
+    }
+  }
+
+  function quick_actions__action_submitted(data) {
+    const result = JSON.stringify(actions_data[selected_action].map(step => step.data), null, 2)
+    _.send_quick_actions?.({ type: 'deactivate_input_field' })
+    _.up?.({ type: 'action_submitted', data: { result, selected_action } })
+  }
+
+  // -------------------------------
+  // Protocol: steps wizard
+  // -------------------------------
+
+  function steps_wizard_protocol(send) {
+    _.send_steps_wizard = send
+
+    const steps_handlers = {
+      step_clicked: steps_wizard__step_clicked
+    }
+
+    return function on({ type, data }) {
+      const handler = steps_handlers[type] || default_steps_handler
+      handler(data, type)
+    }
+  }
+
+  function steps_wizard__step_clicked(data) {
+    _.send_quick_actions?.({ type: 'update_current_step', data })
+    _.up?.({ type: 'render_form', data })
+  }
+
   function onmessage ({ type, data }) {
-    _.send_quick_actions({ type, data })
+    console.log('action_bar.onmessage', type, data)
+    parent_handler[type]?.(data, type)
+  }
+
+  function load_actions(data, type) {
+    actions_data = data
+    _.send_actions?.({ type, data })
+  }
+  function parent__selected_action(data, type) {
+    _.send_quick_actions?.({ type, data })
+  }
+  function show_submit_btn(data, type) {
+    _.send_quick_actions?.({ type: 'show_submit_btn' })
+  }
+  function hide_submit_btn(data, type) {
+    _.send_quick_actions?.({ type: 'hide_submit_btn' })
+  }
+  function form_data(data, type) {
+    _.send_steps_wizard?.({ type: 'init_data', data: actions_data[selected_action] })
   }
 }
 
@@ -94,9 +1449,9 @@ function fallback_module() {
   return {
     api: fallback_instance,
     _: {
-      'quick_actions': {
-        $: ''
-      },
+      'quick_actions': { $: '' },
+      'actions': { $: '' },
+      'steps_wizard': { $: '' }
     }
   }
   function fallback_instance() {
@@ -110,6 +1465,22 @@ function fallback_module() {
             'actions': 'actions',
             'hardcons': 'hardcons'
           }
+        },
+        'actions': {
+          0: '',
+          mapping: {
+            'style': 'style',
+            'icons': 'icons',
+            'actions': 'actions',
+            'hardcons': 'hardcons'
+          }
+        },
+        'steps_wizard': {
+          0: '',
+          mapping: {
+            'style': 'style',
+            'variables': 'variables'
+          }
         }
       },
       drive: {
@@ -121,6 +1492,10 @@ function fallback_module() {
         'style/': {
           'theme.css': {
             raw: `
+              .container {
+                display: flex;
+                flex-direction: column;
+              }
               .action-bar-container {
                 display: flex;
                 flex-direction: row;
@@ -142,10 +1517,10 @@ function fallback_module() {
                 align-items: center;
                 min-width: 300px;
               }
-              .replaced-quick-actions {
-                display: flex;
-                flex: auto;
+              .hide {
+                display: none;
               }
+              
               .icon-btn {
                 display: flex;
                 min-width: 32px;
@@ -174,8 +1549,9 @@ function fallback_module() {
     }
   }
 }
+
 }).call(this)}).call(this,"/src/node_modules/action_bar/action_bar.js")
-},{"STATE":1,"quick_actions":7}],3:[function(require,module,exports){
+},{"STATE":3,"actions":5,"quick_actions":12,"steps_wizard":15}],5:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -230,9 +1606,25 @@ async function actions(opts, protocol) {
       case 'send_selected_action':
         send_selected_action(data)
         break
+      case 'load_actions':
+        // Handle the new data format from program_protocol
+        handleLoadActions(data)
+        break
       default:
         fail(data, type)
     }
+  }
+
+  function handleLoadActions(data) {   
+    const converted_actions = Object.keys(data).map(actionKey => ({
+      action: actionKey,
+      pinned: false,
+      default: true,
+      icon: 'file'
+    }))
+    
+    actions = converted_actions
+    create_actions_menu()
   }
   
   function send_selected_action (msg) {
@@ -481,7 +1873,7 @@ function fallback_module() {
 }
 
 }).call(this)}).call(this,"/src/node_modules/actions/actions.js")
-},{"STATE":1}],4:[function(require,module,exports){
+},{"STATE":3}],6:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -816,58 +2208,472 @@ function fallback_module () {
   }
 }
 }).call(this)}).call(this,"/src/node_modules/console_history/console_history.js")
-},{"STATE":1}],5:[function(require,module,exports){
+},{"STATE":3}],7:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
-const { get } = statedb(fallback_module)
+const { sdb, get } = statedb(fallback_module)
 
-module.exports = graph_explorer
+module.exports = form_input
+async function form_input (opts, protocol) {
+  const { id, sdb } = await get(opts.sid)
+  const {drive} = sdb
+	
+	const on = {
+    style: inject,
+    data: ondata
+  }
 
-async function graph_explorer(opts) {
-  const { sdb } = await get(opts.sid)
-  const { drive } = sdb
-
-  let scroll_value = 0
-
-  const on = {
-    entries: on_entries,
-    style: inject_style
+  let current_step = null
+  let input_accessible = true
+	
+	if(protocol){
+    send = protocol(msg => onmessage(msg))
+    _ = { up: send }
   }
 
   const el = document.createElement('div')
-  el.className = 'graph-explorer-wrapper'
-  el.onscroll = () => {
-    scroll_value = el.scrollTop
-  }
   const shadow = el.attachShadow({ mode: 'closed' })
-  shadow.innerHTML = `<div class="graph-container"></div>`
-  const container = shadow.querySelector('.graph-container')
+  shadow.innerHTML = `
+  <div class="input-display">
+    <div class='test'>
+      <input class="input-field" type="text" placeholder="Type to submit">
+    </div>
+    <div class="overlay-lock" hidden></div>
+  </div>
+  <style>
+  </style>`
+  const style = shadow.querySelector('style')
+  
+	const input_field_el = shadow.querySelector('.input-field')
+  const overlay_el = shadow.querySelector('.overlay-lock')
 
-  let all_entries = {}
-  let view = []
-  const instance_states = {}
+	input_field_el.oninput = async function () {
+    if (!input_accessible) return
+    await drive.put('data/form_input.json', {
+      input_field: this.value
+    })
+		if (this.value.length >= 10) {
+			_.up({
+        type: 'action_submitted',
+        data: {
+          value: this.value,
+          index: current_step?.index || 0
+        }
+      })
+			console.log('mark_as_complete')
+		} else {
+      _.up({
+        type: 'action_incomplete',
+        data: {
+          value: this.value,
+          index: current_step?.index || 0
+        }
+      })
+    }
+	}
 
-  let start_index = 0
-  let end_index = 0
-  const chunk_size = 50
-  const max_rendered_nodes = chunk_size * 3
-  const node_height = 22
+  const subs = await sdb.watch(onbatch)
 
-  const top_sentinel = document.createElement('div')
-  const bottom_sentinel = document.createElement('div')
-  top_sentinel.className = 'sentinel'
-  bottom_sentinel.className = 'sentinel'
-
-  const observer = new IntersectionObserver(handle_sentinel_intersection, {
-    root: el,
-    threshold: 0
-  })
-
-  await sdb.watch(onbatch)
+  const parent_handler = {
+    step_data,  
+    reset_data
+  }
 
   return el
 
+  async function onbatch(batch) {
+    for (const { type, paths } of batch){
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+
+  function fail(data, type) { throw new Error('invalid message', { cause: { data, type } }) }
+
+  function inject (data) {
+    style.replaceChildren((() => {
+      return document.createElement('style').textContent = data[0]
+    })())
+  }
+
+  function ondata(data) {
+    if (data && data.length > 0) {
+      const input_data = data[0]
+      if (input_data && input_data.input_field) {
+        input_field_el.value = input_data.input_field
+      }
+    } else {
+      input_field_el.value = ''
+    }
+  }
+
+	function onmessage ({ type, data }) {
+    console.log('message from form_input', type, data)
+    parent_handler[type]?.(data, type)
+  }
+  
+  function step_data(data, type) {
+    current_step = data 
+
+    input_accessible = data?.is_accessible !== false
+    
+    overlay_el.hidden = input_accessible
+
+    input_field_el.placeholder = input_accessible
+      ? 'Type to submit'
+      : 'Input disabled for this step'
+  }
+
+  function reset_data(data, type) {
+    input_field_el.value = ''
+    drive.put('data/form_input.json', {
+      input_field: ''
+    })
+  }
+
+}
+function fallback_module () {
+  return {
+    api: fallback_instance,
+  }
+  function fallback_instance () {
+    return {
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+            .input-display {
+              position: relative;
+							background: #131315;
+              border-radius: 16px;
+              border: 1px solid #3c3c3c;
+							display: flex;
+							flex: 1;
+							align-items: center;
+							padding: 0 12px;
+							min-height: 32px;
+            }
+						.input-display:focus-within {
+							border-color: #4285f4;
+							background: #1a1a1c;
+            }	
+						.input-field {
+							flex: 1;
+							min-height: 32px;
+							background: transparent;
+							border: none;
+							color: #e8eaed;
+							padding: 0 12px;
+							font-size: 14px;
+							outline: none;
+						}
+						.input-field::placeholder {
+							color: #a6a6a6;
+						}
+            .overlay-lock {
+              position: absolute;
+              inset: 0;
+              background: transparent;
+              z-index: 10;
+              cursor: not-allowed;
+            }
+						`
+          }
+        },
+        'data/': {
+          'form_input.json': {
+            raw:  {
+              input_field: ""
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/src/node_modules/form_input.js")
+},{"STATE":3}],8:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { sdb, get } = statedb(fallback_module)
+
+module.exports = input_test
+async function input_test (opts, protocol) {
+  const { id, sdb } = await get(opts.sid)
+  const {drive} = sdb
+	
+	const on = {
+    style: inject,
+    data: ondata
+  }
+
+  let current_step = null
+  let input_accessible = true
+  
+	if(protocol){
+    send = protocol(msg => onmessage(msg))
+    _ = { up: send }
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+	<div class='title'> Testing 2nd Type </div>
+  <div class="input-display">
+    <input class="input-field" type="text" placeholder="Type to submit">
+    <div class="overlay-lock" hidden></div>
+  </div>
+  <style>
+  </style>`
+  const style = shadow.querySelector('style')
+  
+	const input_field_el = shadow.querySelector('.input-field')
+  const overlay_el = shadow.querySelector('.overlay-lock')
+
+	input_field_el.oninput = async function () {
+    if (!input_accessible) return
+
+    await drive.put('data/input_test.json', {
+      input_field: this.value
+    })
+
+		if (this.value.length >= 10) {
+			_.up({
+        type: 'action_submitted',
+        data: {
+          value: this.value,
+          index: current_step?.index || 0
+        }
+      })
+			console.log('mark_as_complete')
+		} else {
+      _.up({
+        type: 'action_incomplete',
+        data: {
+          value: this.value,
+          index: current_step?.index || 0
+        }
+      })
+    }
+	}
+
+  const subs = await sdb.watch(onbatch)
+  
+  const parent_handler = {
+    step_data,
+    reset_data
+  }
+
+  return el
+
+  async function onbatch(batch) {
+    for (const { type, paths } of batch){
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+
+  function fail(data, type) { throw new Error('invalid message', { cause: { data, type } }) }
+
+  function inject (data) {
+    style.replaceChildren((() => {
+      return document.createElement('style').textContent = data[0]
+    })())
+  }
+
+  function ondata(data) {
+    if (data && data.length > 0) {
+      const input_data = data[0]
+      if (input_data && input_data.input_field) {
+        input_field_el.value = input_data.input_field
+      }
+    } else {
+      input_field_el.value = ''
+    }
+  }
+
+  // ------------------
+  // Parent Observer
+  // ------------------
+
+	function onmessage ({ type, data }) {
+    console.log('message from input_test', type, data)
+    parent_handler[type]?.(data, type)
+  }
+
+  function step_data(data, type) {
+    current_step = data 
+
+    input_accessible = data?.is_accessible !== false
+    
+    overlay_el.hidden = input_accessible
+
+    input_field_el.placeholder = input_accessible
+      ? 'Type to submit'
+      : 'Input disabled for this step'
+  }
+
+  function reset_data(data, type) {
+    input_field_el.value = ''
+    drive.put('data/input_test.json', {
+      input_field: ''
+    })
+  }
+
+}
+function fallback_module () {
+  return {
+    api: fallback_instance,
+  }
+  function fallback_instance () {
+    return {
+      drive: {
+        'style/': {
+          'theme.css': {
+            raw: `
+						.title {
+							color: #e8eaed;
+							font-size: 18px;
+						}
+            .input-display {
+              position: relative;
+							background: #131315;
+              border-radius: 16px;
+              border: 1px solid #3c3c3c;
+							display: flex;
+							flex: 1;
+							align-items: center;
+							padding: 0 12px;
+							min-height: 32px;
+            }
+						.input-display:focus-within {
+							border-color: #4285f4;
+							background: #1a1a1c;
+            }	
+						.input-field {
+							flex: 1;
+							min-height: 32px;
+							background: transparent;
+							border: none;
+							color: #e8eaed;
+							padding: 0 12px;
+							font-size: 14px;
+							outline: none;
+						}
+						.input-field::placeholder {
+							color: #a6a6a6;
+						}
+            .overlay-lock {
+              position: absolute;
+              inset: 0;
+              background: transparent;
+              z-index: 10;
+              cursor: not-allowed;
+            }
+						`
+          }
+        },
+        'data/': {
+          'input_test.json': {
+            raw:  {
+              input_field: ""
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/src/node_modules/input_test.js")
+},{"STATE":3}],9:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { sdb, get } = statedb(fallback_module)
+
+const program = require('program')
+const action_bar = require('action_bar')
+
+const { form_input, input_test } = program
+
+const component_modules = {
+  form_input,
+  input_test
+  // Add more form input components here if needed
+}
+
+module.exports = manager
+
+async function manager(opts) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+  }
+
+  let variables = []
+  let selected_action = null
+
+  const _ = {
+    send_actions_bar: null,
+    send_form_input: {},
+    send_steps_wizard: null,
+    send_program: null
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+    <div class="main">
+      <form-input></form-input>
+      <action-bar></action-bar>
+      <program></program>
+    </div>
+    <style></style>
+  `
+
+  const style = shadow.querySelector('style')
+  const form_input_placeholder = shadow.querySelector('form-input')
+  const program_placeholder = shadow.querySelector('program')
+  const action_bar_placeholder = shadow.querySelector('action-bar')
+
+  const subs = await sdb.watch(onbatch)
+
+  const action_bar_el = await action_bar(subs[0], actions_bar_protocol)
+  action_bar_placeholder.replaceWith(action_bar_el)
+
+  const program_el = await program(subs[1], program_protocol)
+  program_el.classList.add('hide')
+  program_placeholder.replaceWith(program_el)
+
+
+  const form_input_elements = {}
+
+  console.log('subs', subs)
+
+  for (const [index, [component_name, component_fn]] of Object.entries(component_modules).entries()) {
+    const final_index = index + 2
+  
+    console.log('final_index', final_index, component_name, subs[final_index])
+    
+    const el = await component_fn(subs[final_index], form_input_protocol(component_name))
+    el.classList.add('hide')
+    form_input_elements[component_name] = el
+    form_input_placeholder.parentNode.insertBefore(el, form_input_placeholder)
+  }
+
+  form_input_placeholder.remove()
+
+  return el
+
+  // --- Internal Functions ---
   async function onbatch(batch) {
     for (const { type, paths } of batch) {
       const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
@@ -876,342 +2682,223 @@ async function graph_explorer(opts) {
     }
   }
 
-  function fail (data, type) { throw new Error('invalid message', { cause: { data, type } }) }
+  function fail(data, type) {
+    throw new Error('invalid message', { cause: { data, type } })
+  }
 
-  function on_entries(data) {
-    all_entries = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
-    const root_path = '/'
-    if (all_entries[root_path]) {
-      if (!instance_states[root_path]) {
-        instance_states[root_path] = { expanded_subs: true, expanded_hubs: false }
-      }
-      build_and_render_view()
+  function inject(data) {
+    style.replaceChildren((() => {
+      return document.createElement('style').textContent = data[0]
+    })())
+  }
+
+  function toggle_view(el, show) {
+    el.classList.toggle('hide', !show)
+  }
+
+  function get_form_input_component_index(component) {
+    const { _: components } = fallback_module()
+    return Object.keys(components).indexOf(component)
+  }
+  
+  function render_form_component(component_name) {
+    for (const name in form_input_elements) {
+      toggle_view(form_input_elements[name], name === component_name)
     }
   }
 
-  function inject_style(data) {
-    const sheet = new CSSStyleSheet()
-    sheet.replaceSync(data[0])
-    shadow.adoptedStyleSheets = [sheet]
+  
+  // -------------------------------
+  // Protocol: form input
+  // -------------------------------
+
+  function form_input_protocol(component_name) {
+    return function (send) {
+      _.send_form_input[component_name] = send
+      
+      const form_input_handlers = {
+        action_submitted: form__action_submitted,
+        action_incomplete: form__action_incomplete,
+      }
+
+      return function on({ type, data }) {  
+        const handler = form_input_handlers[type] || fail
+        handler(data, type)
+      }
+    }
   }
 
-  function build_and_render_view(focal_instance_path = null) {
-    const old_view = [...view]
-    const old_scroll_top = scroll_value
-
-    view = build_view_recursive({
-      base_path: '/',
-      parent_instance_path: '',
-      depth: 0,
-      is_last: true,
-      is_hub: false,
-      parent_pipe_trail: [],
-      instance_states,
-      all_entries
+  function form__action_submitted(data, type) {
+    console.log('manager.on_form_submitted', data, variables, selected_action)
+    const step = variables[selected_action][data?.index]
+    Object.assign(step, {
+      is_completed: true,
+      status: 'completed',
+      data: data?.value
     })
+    _.send_program?.({ type: 'update_data', data: variables })
+    _?.send_actions_bar({ type: "form_data", data: variables[selected_action] })
 
-    let focal_index = -1
-    if (focal_instance_path) {
-      focal_index = view.findIndex(
-        node => node.instance_path === focal_instance_path
-      )
+    if (variables[selected_action][variables[selected_action].length - 1]?.is_completed) {
+      _.send_actions_bar({ type: 'show_submit_btn' })
     }
-    if (focal_index === -1) {
-      focal_index = Math.floor(old_scroll_top / node_height)
-    }
+  }
 
-    const old_focal_node = old_view[focal_index]
-    let new_scroll_top = old_scroll_top
+  function form__action_incomplete(data, type) {
+    console.log('manager.on_form_incomplete', data, variables, selected_action)
+    const step = variables[selected_action][data?.index]
 
-    if (old_focal_node) {
-      const old_focal_instance_path = old_focal_node.instance_path
-      const new_focal_index = view.findIndex(
-        node => node.instance_path === old_focal_instance_path
-      )
-      if (new_focal_index !== -1) {
-        const scroll_diff = (new_focal_index - focal_index) * node_height
-        new_scroll_top = old_scroll_top + scroll_diff
-      }
-    }
+    if (!step.is_completed) return
 
-    start_index = Math.max(0, focal_index - Math.floor(chunk_size / 2))
-    end_index = start_index
-
-    container.replaceChildren()
-    container.appendChild(top_sentinel)
-    container.appendChild(bottom_sentinel)
-    observer.observe(top_sentinel)
-    observer.observe(bottom_sentinel)
-
-    render_next_chunk()
-
-    requestAnimationFrame(() => {
-      el.scrollTop = new_scroll_top
+    Object.assign(step, {
+      is_completed: false,
+      status: 'error',
+      data: data?.value
     })
-  }
-
-  function build_view_recursive(args) {
-    const {
-      base_path,
-      parent_instance_path,
-      depth,
-      is_last,
-      is_hub,
-      parent_pipe_trail,
-      instance_states,
-      all_entries
-    } = args
-
-    const instance_path = `${parent_instance_path}|${base_path}`
-    const entry = all_entries[base_path]
-    if (!entry) return []
-
-    if (!instance_states[instance_path]) {
-      instance_states[instance_path] = {
-        expanded_subs: false,
-        expanded_hubs: false
-      }
-    }
-    const state = instance_states[instance_path]
-    const children_pipe_trail = [...parent_pipe_trail]
-    if (depth > 0) {
-      children_pipe_trail.push(!is_last)
-    }
-
-    let current_view = []
-
-    if (state.expanded_hubs && entry.hubs) {
-      entry.hubs.forEach((hub_path, i, arr) => {
-        current_view = current_view.concat(
-          build_view_recursive({
-            base_path: hub_path,
-            parent_instance_path: instance_path,
-            depth: depth + 1,
-            is_last: i === arr.length - 1,
-            is_hub: true,
-            parent_pipe_trail: children_pipe_trail,
-            instance_states,
-            all_entries
-          })
-        )
-      })
-    }
-
-    current_view.push({
-      base_path,
-      instance_path,
-      depth,
-      is_last,
-      is_hub,
-      pipe_trail: parent_pipe_trail
-    })
-
-    if (state.expanded_subs && entry.subs) {
-      entry.subs.forEach((sub_path, i, arr) => {
-        current_view = current_view.concat(
-          build_view_recursive({
-            base_path: sub_path,
-            parent_instance_path: instance_path,
-            depth: depth + 1,
-            is_last: i === arr.length - 1,
-            is_hub: false,
-            parent_pipe_trail: children_pipe_trail,
-            instance_states,
-            all_entries
-          })
-        )
-      })
-    }
-    return current_view
-  }
-
-  function handle_sentinel_intersection(entries) {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        if (entry.target === top_sentinel) render_prev_chunk()
-        else if (entry.target === bottom_sentinel) render_next_chunk()
-      }
-    })
-  }
-
-  function render_next_chunk() {
-    if (end_index >= view.length) return
-    const fragment = document.createDocumentFragment()
-    const next_end = Math.min(view.length, end_index + chunk_size)
-    for (let i = end_index; i < next_end; i++) {
-      fragment.appendChild(create_node(view[i]))
-    }
-    container.insertBefore(fragment, bottom_sentinel)
-    end_index = next_end
-    cleanup_dom(false)
-  }
-
-  function render_prev_chunk() {
-    if (start_index <= 0) return
-    const fragment = document.createDocumentFragment()
-    const prev_start = Math.max(0, start_index - chunk_size)
-    for (let i = prev_start; i < start_index; i++) {
-      fragment.appendChild(create_node(view[i]))
-    }
-    const old_scroll_height = container.scrollHeight
-    const old_scroll_top = el.scrollTop
-    container.insertBefore(fragment, top_sentinel.nextSibling)
-    start_index = prev_start
-    el.scrollTop = old_scroll_top + (container.scrollHeight - old_scroll_height)
-    cleanup_dom(true)
-  }
-
-  function cleanup_dom(is_scrolling_up) {
-    const rendered_count = end_index - start_index
-    if (rendered_count < max_rendered_nodes) return
-    const to_remove_count = rendered_count - max_rendered_nodes
-    if (is_scrolling_up) {
-      for (let i = 0; i < to_remove_count; i++) {
-        bottom_sentinel.previousElementSibling.remove()
-      }
-      end_index -= to_remove_count
-    } else {
-      for (let i = 0; i < to_remove_count; i++) {
-        top_sentinel.nextElementSibling.remove()
-      }
-      start_index += to_remove_count
-    }
-  }
-
-  function get_prefix(is_last, has_subs, state, is_hub) {
-    const { expanded_subs, expanded_hubs } = state
-    if (is_hub) {
-      if (expanded_subs && expanded_hubs) return '┌┼'
-      if (expanded_subs) return '┌┬'
-      if (expanded_hubs) return '┌┴'
-      return '┌─'
-    } else if (is_last) {
-      if (expanded_subs && expanded_hubs) return '└┼'
-      if (expanded_subs) return '└┬'
-      if (expanded_hubs) return '└┴'
-      return '└─'
-    } else {
-      if (expanded_subs && expanded_hubs) return '├┼'
-      if (expanded_subs) return '├┬'
-      if (expanded_hubs) return '├┴'
-      return '├─'
-    }
-  }
-
-  function create_node({ base_path, instance_path, depth, is_last, is_hub, pipe_trail }) {
-    const entry = all_entries[base_path]
-    const state = instance_states[instance_path]
-    const el = document.createElement('div')
-    el.className = `node type-${entry.type}`
-    el.dataset.instance_path = instance_path
-
-    const has_hubs = entry.hubs && entry.hubs.length > 0
-    const has_subs = entry.subs && entry.subs.length > 0
+    _.send_program?.({ type: 'update_data', data: variables })
+    _?.send_actions_bar({ type: "form_data", data: variables[selected_action] })
+    _.send_actions_bar({ type: 'hide_submit_btn' })
     
-    if (depth) {
-      el.style.paddingLeft = '20px'
+  }
+  
+  // -------------------------------
+  // Protocol: program
+  // -------------------------------
+
+  function program_protocol(send) {
+    _.send_program = send
+
+    const program_handlers = {
+      load_actions: program__load_actions
+    }
+    return function on({ type, data }) {
+      const handler = program_handlers[type] || fail
+      handler(data, type)
+    }
+  }
+
+  function program__load_actions(data, type) {
+    variables = data  
+    _.send_actions_bar?.({ type, data })
+  }
+
+  // -------------------------------
+  // Protocol: action bar
+  // -------------------------------
+
+  function actions_bar_protocol(send) {
+    _.send_actions_bar = send
+
+    const action_bar_handlers = {
+      render_form: action_bar__render_form,
+      clean_up: action_bar__clean_up,
+      action_submitted: action_bar__action_submitted,
+      selected_action: action_bar__selected_action
     }
 
-    if (base_path === '/' && instance_path === '|/') {
-      const { expanded_subs } = state
-      const prefix_symbol = expanded_subs ? '🪄┬' : '🪄─'
-      const prefix_class = has_subs ? 'prefix clickable' : 'prefix'
-      el.innerHTML = `<span class="${prefix_class}">${prefix_symbol}</span><span class="name">/🌐</span>`
-      if (has_subs) {
-        el.querySelector('.prefix').onclick = () => toggle_subs(instance_path)
-        el.querySelector('.name').onclick = () => toggle_subs(instance_path)
+    return function on({ type, data }) {
+      const handler = action_bar_handlers[type] || fail
+      handler(data, type)
+    }
+  }
+
+  function action_bar__render_form(data, type) {
+    render_form_component(data.component)
+    const send = _.send_form_input[data.component]
+    if (send) send({ type: 'step_data', data })
+  }
+
+  function action_bar__action_submitted(data, type) {
+    _.send_program({ type: 'display_result', data })
+  }
+
+  function action_bar__selected_action(data, type) {
+    selected_action = data
+  }
+
+  function action_bar__clean_up(data, type) {
+    data && cleanup(data)
+  }
+
+  function cleanup(selected_action) {
+    const cleaned = variables[selected_action].map(step => ({
+      ...step,
+      is_completed: false,
+      data: ''
+    }))
+    variables[selected_action] = cleaned
+    _.send_program?.({ type: 'update_data', data: variables })
+
+    for (const step of variables[selected_action]) {
+      if (step.component && _.send_form_input[step.component]) {
+        _.send_form_input[step.component]({ type: 'reset_data'})
       }
-      return el
     }
 
-    const prefix_symbol = get_prefix(is_last, has_subs, state, is_hub)
-    const pipe_html = pipe_trail.map(should_pipe => `<span class=${should_pipe ? 'pipe' : 'blank'}>${should_pipe ? '│' : ' '}</span>`).join('')
-    
-    const prefix_class = (!has_hubs || base_path !== '/') ? 'prefix clickable' : 'prefix'
-    const icon_class = has_subs ? 'icon clickable' : 'icon'
-
-    el.innerHTML = `
-      <span class="indent">${pipe_html}</span>
-      <span class="${prefix_class}">${prefix_symbol}</span>
-      <span class="${icon_class}"></span>
-      <span class="name">${entry.name}</span>
-    `
-    if(has_hubs && base_path !== '/') el.querySelector('.prefix').onclick = () => toggle_hubs(instance_path)
-    if(has_subs) el.querySelector('.icon').onclick = () => toggle_subs(instance_path)
-    return el
-  }
-
-  function toggle_subs(instance_path) {
-    const state = instance_states[instance_path]
-    if (state) {
-      state.expanded_subs = !state.expanded_subs
-      build_and_render_view(instance_path)
-    }
-  }
-
-  function toggle_hubs(instance_path) {
-    const state = instance_states[instance_path]
-    if (state) {
-      state.expanded_hubs = !state.expanded_hubs
-      build_and_render_view(instance_path)
+    for (const el of Object.values(form_input_elements)) {
+      console.log('toggle_view', el, false)
+      toggle_view(el, false)
     }
   }
 }
 
+// --- Fallback Module ---
 function fallback_module() {
   return {
-    api: fallback_instance
+    api: fallback_instance,
+    _: {
+      'action_bar': { $: '' },
+      'program': { $: '' },
+    }
   }
+
   function fallback_instance() {
     return {
-      drive: {
-        'entries/': {
-          'entries.json': { $ref: 'entries.json' }
+      _: {
+        'action_bar': {
+          0: '',
+          mapping: {
+            'icons': 'icons',
+            'style': 'style'
+          }
         },
+        'program': {
+          0: '',
+          mapping: {
+            'style': 'style',
+            'variables': 'variables',
+          }
+        },
+        'program>form_input': {
+          0: '',
+          mapping: {
+            'style': 'style',
+            'data': 'data',
+          }
+        },
+        'program>input_test': {
+          0: '',
+          mapping: {
+            'style': 'style',
+            'data': 'data',
+          }
+        }
+      },
+      drive: {
         'style/': {
-          'theme.css': {
+          'manager.css': { 
             raw: `
-              .graph-container {
-                color: #abb2bf;
-                background-color: #282c34;
-                padding: 10px;
-                height: 500px; /* Or make it flexible */
-                overflow: auto;
-              }
-              .node {
+              .main {
                 display: flex;
-                align-items: center;
-                white-space: nowrap;
-                cursor: default;
-                height: 22px; /* Important for scroll calculation */
+                flex-direction: column;
+                width: 100%;
+                height: 100%;
+                background: #131315;
               }
-              .indent {
-                display: flex;
+              .hide {
+                display: none;
               }
-              .pipe {
-                text-align: center;
-              }
-              .blank {
-                width: 10px;
-                text-align: center;
-              }
-              .clickable {
-                cursor: pointer;
-              }
-              .prefix, .icon {
-                margin-right: 6px;
-              }
-              .icon { display: inline-block; text-align: center; }
-              .name { flex-grow: 1; }
-              .node.type-root > .icon::before { content: '🌐'; }
-              .node.type-folder > .icon::before { content: '📁'; }
-              .node.type-html-file > .icon::before { content: '📄'; }
-              .node.type-js-file > .icon::before { content: '📜'; }
-              .node.type-css-file > .icon::before { content: '🎨'; }
-              .node.type-json-file > .icon::before { content: '📝'; }
-              .node.type-file > .icon::before { content: '📄'; }
-              .sentinel { height: 1px; }
-            `
+            ` 
           }
         }
       }
@@ -1219,8 +2906,8 @@ function fallback_module() {
   }
 }
 
-}).call(this)}).call(this,"/src/node_modules/graph_explorer/graph_explorer.js")
-},{"STATE":1}],6:[function(require,module,exports){
+}).call(this)}).call(this,"/src/node_modules/manager/manager.js")
+},{"STATE":3,"action_bar":4,"program":11}],10:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -1475,7 +3162,131 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/src/node_modules/menu.js")
-},{"STATE":1}],7:[function(require,module,exports){
+},{"STATE":3}],11:[function(require,module,exports){
+(function (__filename){(function (){
+const STATE = require('STATE')
+const statedb = STATE(__filename)
+const { sdb, get } = statedb(fallback_module)
+
+const form_input = require('form_input')
+const input_test = require('input_test')
+
+
+program.form_input = form_input
+program.input_test = input_test
+
+module.exports = program
+
+async function program(opts, protocol) {
+  const { id, sdb } = await get(opts.sid)
+  const { drive } = sdb
+
+  const on = {
+    style: inject,
+    variables: onvariables,
+  }
+
+  const _ = {
+    up: null,
+  }
+
+  if (protocol) {
+    const send = protocol((msg) => onmessage(msg))
+    _.up = send
+  }
+
+  const el = document.createElement('div')
+  const shadow = el.attachShadow({ mode: 'closed' })
+  shadow.innerHTML = `
+    <style></style>
+  `
+
+  const style = shadow.querySelector('style')
+  
+  const subs = await sdb.watch(onbatch)
+  console.log('program', subs)
+
+  const parent_handler = {
+    display_result,
+    update_data
+  }
+
+  return el
+
+  // --- Internal Functions ---
+  async function onbatch(batch) {
+    for (const { type, paths } of batch) {
+      const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
+      const func = on[type] || fail
+      func(data, type)
+    }
+  }
+
+  function fail(data, type) {
+    throw new Error('invalid message', { cause: { data, type } })
+  }
+
+  function inject(data) {
+    style.replaceChildren((() => {
+      return document.createElement('style').textContent = data[0]
+    })())
+  }
+
+  function onvariables(data) {
+    const vars = typeof data[0] === 'string' ? JSON.parse(data[0]) : data[0]
+    _?.up({
+      type: 'load_actions',
+      data: vars,
+    })
+  }
+
+  function onmessage({ type, data }) {
+    parent_handler[type]?.(data, type)
+  }
+  function display_result(data) {
+    console.log('Display Result:', data)
+    alert(`Result of action(${data?.selected_action}): ${data?.result}`)
+  }
+  function update_data(data) {
+    drive.put('variables/program.json', data)
+  }
+}
+
+// --- Fallback Module ---
+function fallback_module() {
+  return {
+    api: fallback_instance,
+    _: {
+      
+      'form_input': { $: '' },
+      'input_test': { $: '' }
+    }
+  }
+
+  function fallback_instance() {
+    return {
+      drive: {
+        'style/': {
+          'program.css': { 
+            raw: `
+              .main {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+              }
+            ` 
+          }
+        },
+        'variables/': {
+          'program.json': { '$ref': 'program.json' }
+        }
+      }
+    }
+  }
+}
+
+}).call(this)}).call(this,"/src/node_modules/program/program.js")
+},{"STATE":3,"form_input":7,"input_test":8}],12:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -1494,6 +3305,9 @@ async function quick_actions(opts, protocol) {
   }
 
   const el = document.createElement('div')
+  el.style.display = 'flex'
+  el.style.flex = 'auto'
+
   const shadow = el.attachShadow({ mode: 'closed' })
   
   
@@ -1505,6 +3319,12 @@ async function quick_actions(opts, protocol) {
       <div class="input-display">
         <span class="slash-prefix">/</span>
         <span class="command-text"></span>
+        <span class="step-display" style="display: none;">
+          <span>steps:<span>
+          <span class="current-step">1</span>
+          <span class="step-separator">-</span>
+          <span class="total-step">1</span>
+        </span>
         <input class="input-field" type="text" placeholder="Type to search actions...">
       </div>
       <button class="submit-btn" style="display: none;"></button>
@@ -1521,21 +3341,24 @@ async function quick_actions(opts, protocol) {
   const input_field = shadow.querySelector('.input-field')
   const submit_btn = shadow.querySelector('.submit-btn')
   const close_btn = shadow.querySelector('.close-btn')
+  const step_display = shadow.querySelector('.step-display')
+  const current_step = shadow.querySelector('.current-step')
+  const total_steps = shadow.querySelector('.total-step')
   const style = shadow.querySelector('style')
   const main = shadow.querySelector('.main')
-
   
   let init = false
   let icons = {}
   let hardcons = {}
   let defaults = []
-  let selected_action = null
   
   let send = null
-  let _ = null
+  const _ = {
+    up: null
+  }
   if(protocol){
     send = protocol(msg => onmessage(msg))
-    _ = { up: send }
+    _.up = send
   }
   text_bar.onclick = activate_input_field
   close_btn.onclick = deactivate_input_field
@@ -1543,15 +3366,39 @@ async function quick_actions(opts, protocol) {
   input_field.oninput = oninput
 
   const subs = await sdb.watch(onbatch)
+
   submit_btn.innerHTML = hardcons.submit
   close_btn.innerHTML = hardcons.cross
+
   return el
 
-  function onmessage ({ type, data }) {
-    if (type === 'selected_action') {
-      select_action(data)
+  function onsubmit() {
+    _.up({ type: 'action_submitted'})
+  }
+  function oninput(e) {
+    _.up({ type: 'filter_actions', data: e.target.value })
+  }
+
+  function update_input_display(selected_action = null) {
+    if (selected_action) {
+      slash_prefix.style.display = 'inline'
+      command_text.style.display = 'inline'
+      command_text.textContent = `#${selected_action.action}`
+      current_step.textContent = selected_action?.current_step || 1
+      total_steps.textContent = selected_action.total_steps || 1
+      step_display.style.display = 'inline-flex'
+      
+      input_field.style.display = 'none'
+    } else {
+      slash_prefix.style.display = 'none'
+      command_text.style.display = 'none'
+      input_field.style.display = 'block'
+      submit_btn.style.display = 'none'
+      step_display.style.display = 'none'
+      input_field.placeholder = 'Type to search actions...'
     }
   }
+
   function activate_input_field() {
     is_input_active = true
     
@@ -1564,16 +3411,19 @@ async function quick_actions(opts, protocol) {
     _.up({ type: 'display_actions', data: 'block' })
   }
 
-  function onsubmit() {
-    if (selected_action) {
-      console.log('Selected action submitted:', selected_action)
-      _.up({ type: 'action_submitted', data: selected_action })
+  function onmessage({ type, data }) {
+    const message_map = {
+      selected_action,
+      deactivate_input_field,
+      show_submit_btn,
+      update_current_step,
+      hide_submit_btn,
     }
+    const handler = message_map[type] || fail
+    handler(data)
   }
-  function oninput(e) {
-    _.up({ type: 'filter_actions', data: e.target.value })
-  }
-  function deactivate_input_field() {
+
+  function deactivate_input_field(data) {
     is_input_active = false
     
     default_actions.style.display = 'flex'
@@ -1582,30 +3432,26 @@ async function quick_actions(opts, protocol) {
     input_wrapper.style.display = 'none'
     
     input_field.value = ''
-    selected_action = null
     update_input_display()
     
     _.up({ type: 'display_actions', data: 'none' })
   }
-  function select_action(action) {
-    selected_action = action
-    update_input_display(selected_action)
+  
+  function show_submit_btn() {
+    submit_btn.style.display = 'flex'
   }
 
-  function update_input_display(selected_action = null) {
-    if (selected_action) {
-      slash_prefix.style.display = 'inline'
-      command_text.style.display = 'inline'
-      command_text.textContent = `"${selected_action.action}"`
-      input_field.style.display = 'none'
-      submit_btn.style.display = 'flex'
-    } else {
-      slash_prefix.style.display = 'none'
-      command_text.style.display = 'none'
-      input_field.style.display = 'block'
-      submit_btn.style.display = 'none'
-      input_field.placeholder = 'Type to search actions...'
-    }
+  function hide_submit_btn() {
+    submit_btn.style.display = 'none'
+  }
+
+  function update_current_step(data) {
+    let current_step_value = data?.index + 1 || 1
+    current_step.textContent = current_step_value
+  }
+
+  function selected_action(data) {
+    update_input_display(data)
   }
 
   async function onbatch(batch) {
@@ -1656,7 +3502,7 @@ async function quick_actions(opts, protocol) {
 
 function fallback_module() {
   return {
-    api: fallback_instance
+    api: fallback_instance,
   }
 
   function fallback_instance() {
@@ -1846,6 +3692,31 @@ function fallback_module() {
                 width: 16px;
                 height: 16px;
               }
+              .step-display {
+                display: inline-flex;
+                align-items: center;
+                gap: 2px;
+                margin-left: 8px;
+                background: #2d2d2d;
+                border: 1px solid #666;
+                border-radius: 4px;
+                padding: 1px 6px;
+                font-size: 12px;
+                color: #fff;
+                font-family: monospace;
+              }
+              .current-step {
+                color:#f0f0f0;
+              }
+              .step-separator {
+                color: #888;
+              }
+              .total-step {
+                color: #f0f0f0;
+              }
+              .hide {
+                display: none;
+              }
             `
           }
         }
@@ -1853,8 +3724,9 @@ function fallback_module() {
     }
   }
 }
+
 }).call(this)}).call(this,"/src/node_modules/quick_actions/quick_actions.js")
-},{"STATE":1}],8:[function(require,module,exports){
+},{"STATE":3}],13:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -2136,7 +4008,7 @@ function fallback_module(){
   }
 }
 }).call(this)}).call(this,"/src/node_modules/quick_editor.js")
-},{"STATE":1}],9:[function(require,module,exports){
+},{"STATE":3}],14:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -2145,7 +4017,7 @@ const { sdb, get } = statedb(fallback_module)
 const console_history = require('console_history')
 const actions = require('actions')
 const tabbed_editor = require('tabbed_editor')
-const graph_explorer = require('graph_explorer')
+const graph_explorer = require('graph-explorer')
 
 module.exports = component
 
@@ -2364,7 +4236,7 @@ function fallback_module () {
       'tabbed_editor': {
         $: ''
       },
-      'graph_explorer': {
+      'graph-explorer': {
         $: ''
       }
     }
@@ -2400,11 +4272,13 @@ function fallback_module () {
             'active_tab': 'active_tab'
           }
         },
-        'graph_explorer': {
+        'graph-explorer': {
           0: '',
           mapping: {
             'style': 'style',
-            'entries': 'entries'
+            'entries': 'entries',
+            'runtime': 'runtime',
+            'mode': 'mode'
           }
         }
       },
@@ -2466,48 +4340,183 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/src/node_modules/space.js")
-},{"STATE":1,"actions":3,"console_history":4,"graph_explorer":5,"tabbed_editor":11}],10:[function(require,module,exports){
+},{"STATE":3,"actions":5,"console_history":6,"graph-explorer":2,"tabbed_editor":16}],15:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
 const { sdb, get } = statedb(fallback_module)
 
-const actions = require('actions')
-
-
 module.exports = steps_wizard
 
-async function steps_wizard (opts) {
+async function steps_wizard (opts, protocol) {
   const { id, sdb } = await get(opts.sid)
   const {drive} = sdb
+  
   const on = {
     style: inject
+  }
+
+  let variables = []
+
+  let _ = null
+  if(protocol){
+    send = protocol(msg => onmessage(msg))
+    _ = { up: send }
   }
 
   const el = document.createElement('div')
   const shadow = el.attachShadow({ mode: 'closed' })
   shadow.innerHTML = `
   <div class="steps-wizard main">
-    <div class="actions-slot"></div>
+    <div class="steps-container">
+      <div class="steps-slot"></div>
+      <button class="nav-arrow left" id="leftArrow">‹</button>
+      <button class="nav-arrow right" id="rightArrow">›</button>
+    </div>
   </div>
   <style>
   </style>
   `
 
   const style = shadow.querySelector('style')
-  const main = shadow.querySelector('.main')
-  const actions_slot = shadow.querySelector('.actions-slot')
-
-
+  const steps_container = shadow.querySelector('.steps-container')
+  const steps_entries = shadow.querySelector('.steps-slot')
+  const leftArrow = shadow.querySelector('#leftArrow')
+  const rightArrow = shadow.querySelector('#rightArrow')
+  
   const subs = await sdb.watch(onbatch)
 
-  let actions_el = null
+  setupArrowNavigation()
 
-  actions_el = await actions(subs[0])
-  actions_slot.replaceWith(actions_el)
-  
+  // for demo purpose
+  render_steps([
+    {name: "Optional Step", "type": "optional", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+	  {name: "Step 2", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 3", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 4", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 5", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 6", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 7", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 8", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 9", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 10", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 11", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+    {name: "Step 12", "type": "mandatory", "is_completed": false, "component": "form_input", "status": "default", "data": ""},
+  ])
+
   return el
+
+  function setupArrowNavigation() {
+    function updateArrows() {
+      const scrollLeft = steps_entries.scrollLeft
+      const maxScroll = steps_entries.scrollWidth - steps_entries.clientWidth
+      
+      if (scrollLeft > 0) {
+        leftArrow.classList.add('visible')
+        steps_container.classList.add('has-left-overflow')
+      } else {
+        leftArrow.classList.remove('visible')
+        steps_container.classList.remove('has-left-overflow')
+      }
+      
+      if (scrollLeft < maxScroll - 1) {
+        rightArrow.classList.add('visible')
+        steps_container.classList.add('has-right-overflow')
+      } else {
+        rightArrow.classList.remove('visible')
+        steps_container.classList.remove('has-right-overflow')
+      }
+    }
+
+    leftArrow.addEventListener('click', () => {
+      const stepWidth = steps_entries.children[0]?.offsetWidth || 200
+      steps_entries.scrollBy({
+        left: -(stepWidth + 8),
+        behavior: 'smooth'
+      })
+    })
+
+    rightArrow.addEventListener('click', () => {
+      const stepWidth = steps_entries.children[0]?.offsetWidth || 200
+      steps_entries.scrollBy({
+        left: stepWidth + 8,
+        behavior: 'smooth'
+      })
+    })
+
+    steps_entries.addEventListener('scroll', updateArrows)
+    
+    window.addEventListener('resize', () => {
+      setTimeout(updateArrows, 100)
+    })
+
+    setTimeout(updateArrows, 100)
+  }
   
+  function onmessage ({ type, data }) {
+    console.log('steps_ data', type, data)
+    if (type === 'init_data') {
+      variables = data
+      render_steps(variables)
+    }
+  }
+  
+  function render_steps(steps) {
+    if (!steps)
+      return;
+
+    steps_entries.innerHTML = '';
+
+    steps.forEach((step, index) => {
+      const btn = document.createElement('button')
+      btn.className = 'step-button'
+      btn.textContent = step.name + (step.type === 'optional' ? ' *' : '')
+      btn.setAttribute('data-step', index + 1)
+
+      const accessible = can_access(index, steps)
+
+      let status = 'default'
+      if (!accessible) status = 'disabled'
+      else if (step.is_completed) status = 'completed'
+      else if (step.status === 'error') status = 'error'
+      else if (step.type === 'optional') status = 'optional'
+
+      btn.classList.add(`step-${status}`)
+
+      btn.onclick = async () => {
+        console.log('Clicked:', step)
+        _?.up({type: 'step_clicked', data: {...step, index, total_steps: steps.length, is_accessible: accessible}})
+      };
+
+      steps_entries.appendChild(btn)
+    });
+    
+    setTimeout(() => {
+      const scrollLeft = steps_entries.scrollLeft
+      const maxScroll = steps_entries.scrollWidth - steps_entries.clientWidth
+      
+      if (scrollLeft > 0) {
+        leftArrow.classList.add('visible')
+        steps_container.classList.add('has-left-overflow')
+      }
+      
+      if (scrollLeft < maxScroll - 1) {
+        rightArrow.classList.add('visible')
+        steps_container.classList.add('has-right-overflow')
+      }
+    }, 100)
+  }
+
+  function can_access(index, steps) {
+    for (let i = 0; i < index; i++) {
+      if (!steps[i].is_completed && steps[i].type !== 'optional') {
+        return false
+      }
+    }
+
+    return true
+  }
+
   async function onbatch(batch) {
     for (const { type, paths } of batch){
       const data = await Promise.all(paths.map(path => drive.get(path).then(file => file.raw)))
@@ -2521,55 +4530,28 @@ async function steps_wizard (opts) {
       return document.createElement('style').textContent = data[0]
     })())
   }
+ 
 }
 
 function fallback_module () {
   return {
-    api: fallback_instance,
-    _: {
-      'actions': {
-        $: ''
-      },
-    }
+    api: fallback_instance
   }
 
   function fallback_instance () {
     return {
-      _: {
-        'actions': {
-          0: '',
-          mapping: {
-            'style': 'style',
-            'actions': 'actions',
-            'icons': 'icons',
-            'hardcons': 'hardcons'
-          }
-        }
-      },
       drive: {
         'style/': {
           'stepswizard.css': {
-            raw: `
-              .steps-wizard {
-                display: flex;
-                flex-direction: column;
-                width: 100%;
-                height: 100%;
-                background: #131315;
-              }
-              .space{
-                height: inherit;
-                }
-            `
+            '$ref': 'stepswizard.css' 
           }
         }
       }
     }
   }
 }
-
 }).call(this)}).call(this,"/src/node_modules/steps_wizard/steps_wizard.js")
-},{"STATE":1,"actions":3}],11:[function(require,module,exports){
+},{"STATE":3}],16:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -2963,7 +4945,7 @@ function fallback_module() {
 }
 
 }).call(this)}).call(this,"/src/node_modules/tabbed_editor/tabbed_editor.js")
-},{"STATE":1}],12:[function(require,module,exports){
+},{"STATE":3}],17:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -3310,7 +5292,7 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/src/node_modules/tabs/tabs.js")
-},{"STATE":1}],13:[function(require,module,exports){
+},{"STATE":3}],18:[function(require,module,exports){
 (function (__filename){(function (){
 const state = require('STATE')
 const state_db = state(__filename)
@@ -3511,7 +5493,7 @@ function fallback_module () {
   }
 }
 }).call(this)}).call(this,"/src/node_modules/tabsbar/tabsbar.js")
-},{"STATE":1,"tabs":12,"task_manager":14}],14:[function(require,module,exports){
+},{"STATE":3,"tabs":17,"task_manager":19}],19:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -3607,7 +5589,7 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/src/node_modules/task_manager.js")
-},{"STATE":1}],15:[function(require,module,exports){
+},{"STATE":3}],20:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -3762,7 +5744,7 @@ function fallback_module() {
 }
 
 }).call(this)}).call(this,"/src/node_modules/taskbar/taskbar.js")
-},{"STATE":1,"action_bar":2,"tabsbar":13}],16:[function(require,module,exports){
+},{"STATE":3,"action_bar":4,"tabsbar":18}],21:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('STATE')
 const statedb = STATE(__filename)
@@ -3898,7 +5880,7 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/src/node_modules/theme_widget/theme_widget.js")
-},{"STATE":1,"space":9,"taskbar":15}],17:[function(require,module,exports){
+},{"STATE":3,"space":14,"taskbar":20}],22:[function(require,module,exports){
 const prefix = 'https://raw.githubusercontent.com/alyhxn/playproject/main/'
 const init_url = location.hash === '#dev' ? 'web/init.js' : prefix + 'src/node_modules/init.js'
 const args = arguments
@@ -3919,7 +5901,7 @@ fetch(init_url, fetch_opts).then(res => res.text()).then(async source => {
   require('./page') // or whatever is otherwise the main entry of our project
 })
 
-},{"./page":18}],18:[function(require,module,exports){
+},{"./page":23}],23:[function(require,module,exports){
 (function (__filename){(function (){
 const STATE = require('../src/node_modules/STATE')
 const statedb = STATE(__filename)
@@ -3940,8 +5922,9 @@ const actions = require('../src/node_modules/actions')
 const tabbed_editor = require('../src/node_modules/tabbed_editor')
 const task_manager = require('../src/node_modules/task_manager')
 const quick_actions = require('../src/node_modules/quick_actions')
-const graph_explorer = require('../src/node_modules/graph_explorer')
+const graph_explorer = require('graph-explorer')
 const editor = require('../src/node_modules/quick_editor')
+const manager = require('../src/node_modules/manager')
 const steps_wizard = require('../src/node_modules/steps_wizard')
 
 const imports = {
@@ -3957,6 +5940,7 @@ const imports = {
   task_manager,
   quick_actions,
   graph_explorer,
+  manager,
   steps_wizard,
 }
 config().then(() => boot({ sid: '' }))
@@ -4217,7 +6201,8 @@ function fallback_module () {
     '../src/node_modules/tabbed_editor',
     '../src/node_modules/task_manager',
     '../src/node_modules/quick_actions',
-    '../src/node_modules/graph_explorer',
+    'graph-explorer',
+    '../src/node_modules/manager',
     '../src/node_modules/steps_wizard'
   ]
   const subs = {}
@@ -4229,6 +6214,20 @@ function fallback_module () {
       'icons': 'icons',
       'variables': 'variables',
       'scroll': 'scroll',
+      'style': 'style'
+    }
+  }
+  subs['../src/node_modules/manager'] = {
+    $: '',
+    0: '',
+    mapping: {
+      'style': 'style'
+    }
+  }
+  subs['../src/node_modules/steps_wizard'] = {
+    $: '',
+    0: '',
+    mapping: {
       'style': 'style'
     }
   }
@@ -4296,12 +6295,14 @@ function fallback_module () {
       'hardcons': 'hardcons'
     }
   }
-  subs['../src/node_modules/graph_explorer'] = {
+  subs['graph-explorer'] = {
     $: '',
     0: '',
     mapping: {
       'style': 'style',
-      'entries': 'entries'
+      'entries': 'entries',
+      'runtime': 'runtime',
+      'mode': 'mode'
     }
   }
   subs[menuname] = { 
@@ -4452,4 +6453,4 @@ function fallback_module () {
 }
 
 }).call(this)}).call(this,"/web/page.js")
-},{"../src/node_modules/STATE":1,"../src/node_modules/action_bar":2,"../src/node_modules/actions":3,"../src/node_modules/console_history":4,"../src/node_modules/graph_explorer":5,"../src/node_modules/menu":6,"../src/node_modules/quick_actions":7,"../src/node_modules/quick_editor":8,"../src/node_modules/space":9,"../src/node_modules/steps_wizard":10,"../src/node_modules/tabbed_editor":11,"../src/node_modules/tabs":12,"../src/node_modules/tabsbar":13,"../src/node_modules/task_manager":14,"../src/node_modules/taskbar":15,"../src/node_modules/theme_widget":16}]},{},[17]);
+},{"../src/node_modules/STATE":3,"../src/node_modules/action_bar":4,"../src/node_modules/actions":5,"../src/node_modules/console_history":6,"../src/node_modules/manager":9,"../src/node_modules/menu":10,"../src/node_modules/quick_actions":12,"../src/node_modules/quick_editor":13,"../src/node_modules/space":14,"../src/node_modules/steps_wizard":15,"../src/node_modules/tabbed_editor":16,"../src/node_modules/tabs":17,"../src/node_modules/tabsbar":18,"../src/node_modules/task_manager":19,"../src/node_modules/taskbar":20,"../src/node_modules/theme_widget":21,"graph-explorer":2}]},{},[22]);
