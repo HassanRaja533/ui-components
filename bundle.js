@@ -5046,50 +5046,53 @@ async function component (opts, protocol) {
   async function create_btn ({ name, id }, index) {
     const el = document.createElement('div')
     el.innerHTML = `
-    <span class="icon">${dricons[index + 1]}</span>
-    <span class='name'>${id}</span>
-    <span class="name">${name}</span>
-    <button class="btn">${dricons[0]}</button>`
+    <span class="icon" data-id="${id}">${dricons[index + 1]}</span>
+    <span class='name' data-id="${id}">${id}</span>
+    <span class="name" data-id="${id}">${name}</span>
+    <button class="btn" data-id="${id}">${dricons[0]}</button>`
 
     el.className = 'tabsbtn'
     const icon_el = el.querySelector('.icon')
-    const name_el = el.querySelector('.name');
+    const name_el = el.querySelector('.name')
     const close_btn = el.querySelector('.btn')
 
-    name_el.draggable = false;
-    
-    // Click on icon
-   icon_el.onclick = () => {
-     current_id = id;
-     highlight_target = 'icon';
-     update_tab_highlight();
+    name_el.draggable = false
+  
+    // Attach named event listeners (feedback ✅)
+    icon_el.onclick = onIconClick
+    name_el.onclick = onNameClick
+    close_btn.onclick = onCloseClick
 
+    entries.appendChild(el)
+    return
+  }
+    
+  function onIconClick() {
+    const id = this.getAttribute('data-id')
+    current_id = id
+    highlight_target = 'icon'
+    update_tab_highlight()
     //  if (_) {
     //   _.up({ type: 'tab_icon_clicked', data: { id , name} })
     //  }
-   };
+  }
 
-
-// Click on name
-   name_el.onclick = () => {
-     current_id = id;
-     highlight_target = 'name';
-     update_tab_highlight();
+  function onNameClick() {
+    const id = this.getAttribute('data-id')
+    current_id = id
+    highlight_target = 'name'
+    update_tab_highlight()
     //  if (_) {
     //   _.up({ type: 'tab_name_clicked', data: { id, name } })
     //  }
-   };
+  }
 
-    // Add click handler for close button
-   close_btn.onclick = (e) => {
-     e.stopPropagation()
-     if (_) {
-       _.up({ type: 'tab_close_clicked', data: { id, name } })
-      }
-   }
-    
-    entries.appendChild(el)
-    return
+  function onCloseClick(event) {
+    event.stopPropagation()
+    const id = this.getAttribute('data-id')
+    if (_) {
+      _.up({ type: 'tab_close_clicked', data: { id, name } })
+    }
   }
 
   async function onbatch(batch) {
@@ -5139,12 +5142,12 @@ async function component (opts, protocol) {
       tab.querySelector('.icon')?.classList.remove('active-icon')
     })
 
-     const target_tab = Array.from(all_tabs).find(tab => {
-     const names = tab.querySelectorAll('.name')
-     return Array.from(names).some(n => n.textContent === current_id)
+    const target_tab = Array.from(all_tabs).find(tab => {
+    const names = tab.querySelectorAll('.name')
+    return Array.from(names).some(n => n.textContent === current_id)
     })
 
-    target_tab.classList.add('active-border');
+    target_tab.classList.add('active-border')
 
     if (highlight_target === 'name') {
       target_tab.querySelectorAll('.name').forEach(n => n.classList.add('active-name'))
@@ -5155,8 +5158,6 @@ async function component (opts, protocol) {
     }
   }
 }
-
-
 
 function fallback_module () {
   return {
@@ -5438,7 +5439,6 @@ function fallback_module () {
                 flex-direction: row;
                 flex-wrap: nowrap;
                 align-items: stretch;
-                border-top: 1px solid #3a3a3a;
               }
               .tabs-bar {
                 display: flex;
@@ -5447,6 +5447,7 @@ function fallback_module () {
                 flex-wrap: nowrap;
                 align-items: stretch;
                 width: 100px;
+                border-top: 1px solid #3a3a3a;
               }
                .bar-btn {
                 display: flex;
