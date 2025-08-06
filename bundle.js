@@ -5439,6 +5439,7 @@ function fallback_module () {
                 flex-direction: row;
                 flex-wrap: nowrap;
                 align-items: stretch;
+                   border-top: 1px solid #3a3a3a;
               }
               .tabs-bar {
                 display: flex;
@@ -5449,7 +5450,7 @@ function fallback_module () {
                 width: 100px;
                 border-top: 1px solid #3a3a3a;
               }
-               .bar-btn {
+              .bar-btn {
                 display: flex;
                 min-width: 32px;
                 border: none;
@@ -5461,19 +5462,22 @@ function fallback_module () {
                 align-items: center;
                 flex: 0 0 auto; 
                 padding-right: 20px;
+                border-top: 1px solid #3a3a3a;
               }
               .hat-btn {
                 display: flex;
                 justify-content: center;
                 align-items: center;
                 width: 56px;
-                border: 1px solid #3a3a3a; 
                 background-color: #131315;
                 cursor: pointer;
                 box-sizing: border-box;
                 padding: 2px 2px;
                 flex-shrink: 0;
                 flex: 0 0 auto;
+                border-top: 1px solid #3a3a3a;
+                border-right: 2px solid #3a3a3a;
+                border-left: 0px solid #3a3a3a;
               }
             `
           }
