@@ -5046,10 +5046,10 @@ async function component (opts, protocol) {
   async function create_btn ({ name, id }, index) {
     const el = document.createElement('div')
     el.innerHTML = `
-    <span class="icon" data-id="${id}">${dricons[index + 1]}</span>
-    <span class='name' data-id="${id}">${id}</span>
-    <span class="name" data-id="${id}">${name}</span>
-    <button class="btn" data-id="${id}">${dricons[0]}</button>`
+    <span class="icon" >${dricons[index + 1]}</span>
+    <span class='name' >${id}</span>
+    <span class="name" >${name}</span>
+    <button class="btn" >${dricons[0]}</button>`
 
     el.className = 'tabsbtn'
     const icon_el = el.querySelector('.icon')
@@ -5058,17 +5058,15 @@ async function component (opts, protocol) {
 
     name_el.draggable = false
   
-    // Attach named event listeners (feedback ✅)
-    icon_el.onclick = onIconClick
-    name_el.onclick = onNameClick
-    close_btn.onclick = onCloseClick
+    icon_el.onclick = () => on_icon_click(id)
+    name_el.onclick = () => on_name_click(id)
+    close_btn.onclick = (e) => on_close_click(e, id)
 
     entries.appendChild(el)
     return
   }
     
-  function onIconClick() {
-    const id = this.getAttribute('data-id')
+  function on_icon_click(id) {
     current_id = id
     highlight_target = 'icon'
     update_tab_highlight()
@@ -5077,8 +5075,7 @@ async function component (opts, protocol) {
     //  }
   }
 
-  function onNameClick() {
-    const id = this.getAttribute('data-id')
+  function on_name_click(id) {
     current_id = id
     highlight_target = 'name'
     update_tab_highlight()
@@ -5087,9 +5084,8 @@ async function component (opts, protocol) {
     //  }
   }
 
-  function onCloseClick(event) {
+  function on_close_click(event,id) {
     event.stopPropagation()
-    const id = this.getAttribute('data-id')
     if (_) {
       _.up({ type: 'tab_close_clicked', data: { id, name } })
     }
@@ -5137,15 +5133,20 @@ async function component (opts, protocol) {
   function update_tab_highlight () {
     const all_tabs = entries.querySelectorAll('.tabsbtn')
     all_tabs.forEach(tab => {
-      tab.classList.remove('active-border')
-      tab.querySelectorAll('.name').forEach(n => n.classList.remove('active-name'))
-      tab.querySelector('.icon')?.classList.remove('active-icon')
-    })
+    tab.classList.remove('active-border')
+    tab.querySelectorAll('.name').forEach(n => n.classList.remove('active-name'))
+    tab.querySelector('.icon')?.classList.remove('active-icon')
+  })
 
     const target_tab = Array.from(all_tabs).find(tab => {
-    const names = tab.querySelectorAll('.name')
-    return Array.from(names).some(n => n.textContent === current_id)
+      const names = tab.querySelectorAll('.name')
+      return Array.from(names).some(n => n.textContent === current_id)
     })
+
+    if (!target_tab) {
+      console.warn(`No tab found for id: ${current_id}`)
+      return null   // ⬅️ explicitly return
+    }
 
     target_tab.classList.add('active-border')
 
@@ -5156,8 +5157,12 @@ async function component (opts, protocol) {
     if (highlight_target === 'icon') {
       target_tab.querySelector('.icon')?.classList.add('active-icon')
     }
+
+    return target_tab   
   }
 }
+
+
 
 function fallback_module () {
   return {
