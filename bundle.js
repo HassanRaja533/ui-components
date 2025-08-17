@@ -5444,7 +5444,7 @@ function fallback_module () {
                 flex-direction: row;
                 flex-wrap: nowrap;
                 align-items: stretch;
-                   border-top: 1px solid #3a3a3a;
+                border-top: 1px solid #3a3a3a;
               }
               .tabs-bar {
                 display: flex;
@@ -5454,6 +5454,21 @@ function fallback_module () {
                 align-items: stretch;
                 width: 100px;
                 border-top: 1px solid #3a3a3a;
+                position: relative;  
+                overflow: hidden; 
+                flex: 1 1 auto;       
+                min-width: 0;  
+              }
+              .tabs-bar::after {
+                content: "";
+                position: absolute;
+                right: 0;
+                top: 0;
+                bottom: 0;
+                width: 80px; 
+                height: 100%;
+                pointer-events: none; 
+                background: linear-gradient(to right, transparent, #131315 60%);
               }
               .bar-btn {
                 display: flex;
